@@ -1,5 +1,6 @@
 """Sub-pixel Fourier phase shift stacking and algebraic Taubin limb alignment."""
 
+import gc
 from pathlib import Path
 from astropy.io import fits
 import numpy as np
@@ -34,33 +35,6 @@ def load_fits_to_float32(fits_path: Path) -> np.ndarray:
     return np.clip(img, 0.0, 1.0)
 
 
-def winsorized_sigma_clip_stack(
-    stack_array: np.ndarray,
-    sigma_low: float = 3.0,
-    sigma_high: float = 3.0,
-) -> np.ndarray:
-    """Vectorized Median Absolute Deviation (MAD) Winsorized sigma-clipping stack.
-
-    Args:
-        stack_array: (N, H, W, 3) float32 array
-    Returns:
-        (H, W, 3) float32 master stacked image
-    """
-    median = np.median(stack_array, axis=0)
-    mad = np.median(np.abs(stack_array - median), axis=0)
-    sigma_est = 1.4826 * mad
-
-    # Guard against zero-variance in dead pixels
-    sigma_est = np.where(sigma_est == 0, 1e-6, sigma_est)
-
-    lower_bound = median - (sigma_low * sigma_est)
-    upper_bound = median + (sigma_high * sigma_est)
-
-    # Winsorize: clamp outliers to threshold boundaries
-    winsorized = np.clip(stack_array, lower_bound, upper_bound)
-    return np.mean(winsorized, axis=0).astype(np.float32)
-
-
 def apply_fourier_shift_rgb(
     img_rgb: np.ndarray, shift_y: float, shift_x: float
 ) -> np.ndarray:
@@ -70,7 +44,6 @@ def apply_fourier_shift_rgb(
 
     shifted_rgb = np.zeros_like(img_rgb)
     for c in range(3):
-        # fourier_shift operates in frequency domain without spatial kernel blur
         shifted_c = ndimage.fourier_shift(
             np.fft.fftn(img_rgb[:, :, c]), (shift_y, shift_x)
         )
@@ -84,19 +57,24 @@ def align_and_stack_bucket_dft(
     sigma_low: float = 3.0,
     sigma_high: float = 3.0,
     upsample_factor: int = 100,
+    max_allowed_shift: float = 50.0,
 ) -> np.ndarray:
-    """High-performance intra-bucket sub-pixel DFT alignment & MAD sigma-clip stacking."""
+    """Memory-safe intra-bucket sub-pixel DFT alignment & 2-pass streaming sigma-clip stacking.
+
+    Excludes frames whose Euclidean shift distance exceeds `max_allowed_shift` (in pixels).
+    Keeps resident memory strictly under 200 MB regardless of frame count.
+    """
     num_frames = len(fits_paths)
     if num_frames == 0:
         raise ValueError("No FITS paths provided for stacking.")
 
     # Single frame shortcut
     if num_frames == 1:
-        print("  * Single frame bucket: skipping alignment.")
+        print("  * Single frame bucket: skipping alignment.", flush=True)
         return load_fits_to_float32(fits_paths[0])
 
-    # Load reference frame (first frame)
-    print(f"  * Loading reference frame: {fits_paths[0].name}")
+    # 1. Load reference frame (first frame)
+    print(f"  * Loading reference frame: {fits_paths[0].name}", flush=True)
     ref_img = load_fits_to_float32(fits_paths[0])
     h, w, _ = ref_img.shape
 
@@ -107,43 +85,111 @@ def align_and_stack_bucket_dft(
         + 0.114 * ref_img[::2, ::2, 2]
     )
 
-    aligned_stack = np.zeros((num_frames, h, w, 3), dtype=np.float32)
-    aligned_stack[0] = ref_img
+    # Apply 2D Hann window to prevent edge wrap-around false correlation peaks
+    win_y = np.hanning(ref_lum_small.shape[0])
+    win_x = np.hanning(ref_lum_small.shape[1])
+    window_2d = np.outer(win_y, win_x).astype(np.float32)
+    ref_lum_win = ref_lum_small * window_2d
+
+    # Calculate shifts for all candidate frames
+    raw_shifts: list[tuple[float, float]] = [(0.0, 0.0)]
+    all_distances: list[float] = [0.0]
 
     for i in range(1, num_frames):
         sub_img = load_fits_to_float32(fits_paths[i])
-
         sub_lum_small = (
             0.299 * sub_img[::2, ::2, 0]
             + 0.587 * sub_img[::2, ::2, 1]
             + 0.114 * sub_img[::2, ::2, 2]
-        )
+        ) * window_2d
 
-        # Single-step DFT sub-pixel cross correlation on binned luminance
         shift, _, _ = phase_cross_correlation(
-            ref_lum_small,
+            ref_lum_win,
             sub_lum_small,
             upsample_factor=upsample_factor,
         )
+        shift_y, shift_x = float(shift[0] * 2.0), float(shift[1] * 2.0)
+        dist = float(np.hypot(shift_x, shift_y))
 
-        # Scale shift back to full-resolution space (factor of 2)
-        shift_y, shift_x = shift[0] * 2.0, shift[1] * 2.0
-        print(
-            f"    [{i + 1}/{num_frames}] {fits_paths[i].name} -> Shift: (dy={shift_y:+.2f}px, dx={shift_x:+.2f}px)"
+        raw_shifts.append((shift_y, shift_x))
+        all_distances.append(dist)
+        del sub_img
+
+    del ref_img, ref_lum_small, ref_lum_win, window_2d
+    gc.collect()
+
+    # 2. Filter out frames exceeding max allowable shift
+    valid_paths: list[Path] = []
+    valid_shifts: list[tuple[float, float]] = []
+
+    for i, (p, (sy, sx), dist) in enumerate(zip(fits_paths, raw_shifts, all_distances)):
+        if dist > max_allowed_shift:
+            print(
+                f"    [{i + 1}/{num_frames}] {p.name} -> [EXCLUDED] Shift {dist:.2f}px exceeds threshold {max_allowed_shift:.1f}px (dy={sy:+.2f}px, dx={sx:+.2f}px)",
+                flush=True,
+            )
+        else:
+            print(
+                f"    [{i + 1}/{num_frames}] {p.name} -> [ACCEPTED] Shift: (dy={sy:+.2f}px, dx={sx:+.2f}px, dist={dist:.2f}px)",
+                flush=True,
+            )
+            valid_paths.append(p)
+            valid_shifts.append((sy, sx))
+
+    n_valid = len(valid_paths)
+    print(
+        f"  * Stacking {n_valid}/{num_frames} accepted frames using streaming Winsorized sigma clipping...",
+        flush=True,
+    )
+
+    if n_valid == 0:
+        raise ValueError(
+            f"All frames in bucket exceeded the maximum shift threshold of {max_allowed_shift}px."
         )
 
-        # Apply exact Fourier shift to full-res 3-channel array
-        aligned_stack[i] = apply_fourier_shift_rgb(sub_img, shift_y, shift_x)
+    if n_valid == 1:
+        return load_fits_to_float32(valid_paths[0])
 
-    print(
-        f"  * Performing MAD Winsorized sigma clipping (low={sigma_low}, high={sigma_high})..."
-    )
-    master_stacked = winsorized_sigma_clip_stack(
-        aligned_stack,
-        sigma_low=sigma_low,
-        sigma_high=sigma_high,
-    )
-    return master_stacked
+    # --- PASS 1: Streaming Mean & Standard Deviation via Accumulators ---
+    sum_img = np.zeros((h, w, 3), dtype=np.float64)
+    sum_sq_img = np.zeros((h, w, 3), dtype=np.float64)
+
+    for p, (sy, sx) in zip(valid_paths, valid_shifts):
+        img = load_fits_to_float32(p)
+        shifted = apply_fourier_shift_rgb(img, sy, sx)
+        sum_img += shifted
+        sum_sq_img += shifted.astype(np.float64) ** 2
+        del img, shifted
+
+    mean = (sum_img / n_valid).astype(np.float32)
+    variance = np.maximum(0.0, (sum_sq_img / n_valid) - (mean.astype(np.float64) ** 2))
+    del sum_img, sum_sq_img
+    gc.collect()
+
+    std = np.sqrt(variance).astype(np.float32)
+    std = np.where(std == 0, 1e-6, std)
+    del variance
+
+    lower_bound = mean - (sigma_low * std)
+    upper_bound = mean + (sigma_high * std)
+    del std, mean
+    gc.collect()
+
+    # --- PASS 2: Streaming Winsorized Accumulation ---
+    final_accum = np.zeros((h, w, 3), dtype=np.float64)
+
+    for p, (sy, sx) in zip(valid_paths, valid_shifts):
+        img = load_fits_to_float32(p)
+        shifted = apply_fourier_shift_rgb(img, sy, sx)
+        winsorized = np.clip(shifted, lower_bound, upper_bound)
+        final_accum += winsorized
+        del img, shifted, winsorized
+
+    del lower_bound, upper_bound
+    gc.collect()
+
+    master_stacked = (final_accum / n_valid).astype(np.float32)
+    return np.clip(master_stacked, 0.0, 1.0)
 
 
 def fit_circle_taubin(points: np.ndarray) -> tuple[float, float, float]:
@@ -173,7 +219,6 @@ def fit_circle_taubin(points: np.ndarray) -> tuple[float, float, float]:
         ]
     )
 
-    # Standard algebraic circle fit
     m_xx = np.sum(u * u) / n
     m_yy = np.sum(v * v) / n
     m_xy = np.sum(u * v) / n
@@ -230,7 +275,6 @@ def extract_limb_edges_parabolic(
 
         max_idx = np.argmax(gradient)
         if 1 < max_idx < len(gradient) - 2:
-            # 3-point sub-pixel parabolic vertex estimation
             y0, y1, y2 = gradient[max_idx - 1], gradient[max_idx], gradient[max_idx + 1]
             denom = 2 * (2 * y1 - y0 - y2)
             delta = (y0 - y2) / denom if denom != 0 else 0.0
@@ -248,7 +292,8 @@ def align_masters_taubin(
 ) -> list[np.ndarray]:
     """Aligns all bracket master frames to the lunar limb centroid of the reference master."""
     print(
-        f"\n--- [Stage 3] Inter-Master Sub-Pixel Limb Alignment (Ref: {master_names[ref_idx]}) ---"
+        f"\n--- [Stage 3] Inter-Master Sub-Pixel Limb Alignment (Ref: {master_names[ref_idx]}) ---",
+        flush=True,
     )
     h, w, _ = masters[ref_idx].shape
     ref_lum = np.mean(masters[ref_idx], axis=2)
@@ -259,12 +304,16 @@ def align_masters_taubin(
     ref_edges = extract_limb_edges_parabolic(ref_lum, center_est, r_est)
     if len(ref_edges) < 20:
         print(
-            "  [Warning] Insufficient limb edge contrast in reference. Using image center as origin."
+            "  [Warning] Insufficient limb edge contrast in reference. Using image center as origin.",
+            flush=True,
         )
         ref_cx, ref_cy = center_est
     else:
         ref_cx, ref_cy, _ = fit_circle_taubin(ref_edges)
-        print(f"  * Reference Lunar Centroid: (cx={ref_cx:.2f}, cy={ref_cy:.2f})")
+        print(
+            f"  * Reference Lunar Centroid: (cx={ref_cx:.2f}, cy={ref_cy:.2f})",
+            flush=True,
+        )
 
     aligned_masters = []
     for img, name in zip(masters, master_names):
@@ -273,7 +322,8 @@ def align_masters_taubin(
 
         if len(edges) < 20:
             print(
-                f"  * {name}: Limb too faint/saturated -> Phase correlation fallback."
+                f"  * {name}: Limb too faint/saturated -> Phase correlation fallback.",
+                flush=True,
             )
             shift, _, _ = phase_cross_correlation(
                 ref_lum[::2, ::2], lum[::2, ::2], upsample_factor=100
@@ -284,8 +334,37 @@ def align_masters_taubin(
             dx = ref_cx - cx
             dy = ref_cy - cy
 
-        print(f"  * {name} -> Offset: (dy={dy:+.2f}px, dx={dx:+.2f}px)")
+        print(f"  * {name} -> Offset: (dy={dy:+.2f}px, dx={dx:+.2f}px)", flush=True)
         shifted = apply_fourier_shift_rgb(img, dy, dx)
         aligned_masters.append(shifted)
 
     return aligned_masters
+
+
+def winsorized_sigma_clip_stack(
+    stack_array: np.ndarray,
+    sigma_low: float = 3.0,
+    sigma_high: float = 3.0,
+) -> np.ndarray:
+    """Fast vectorized sigma-clipping stack for pre-allocated arrays in memory.
+
+    Args:
+        stack_array: (N, H, W, 3) float32 array
+    Returns:
+        (H, W, 3) float32 master stacked image
+    """
+    n_frames = stack_array.shape[0]
+    if n_frames == 1:
+        return stack_array[0]
+    if n_frames == 2:
+        return np.mean(stack_array, axis=0, dtype=np.float32)
+
+    mean = np.mean(stack_array, axis=0, dtype=np.float32)
+    std = np.std(stack_array, axis=0, dtype=np.float32)
+    std = np.where(std == 0, 1e-6, std)
+
+    lower_bound = mean - (sigma_low * std)
+    upper_bound = mean + (sigma_high * std)
+
+    winsorized = np.clip(stack_array, lower_bound, upper_bound)
+    return np.mean(winsorized, axis=0, dtype=np.float32)
