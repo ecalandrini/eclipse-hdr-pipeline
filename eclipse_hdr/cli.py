@@ -9,6 +9,7 @@ from .alignment import (
     align_and_stack_bucket_dft,
     align_masters_taubin,
     load_fits_to_float32,
+    save_preview_jpg,
 )
 from .exif_parser import sort_rafs_by_exposure
 from .hdr_fusion import fuse_and_export_hdr
@@ -28,8 +29,9 @@ def run_stack(
     stacking_engine: str = "python",
     sigma_low: float = 3.0,
     sigma_high: float = 3.0,
+    max_shift: float = 50.0,
 ) -> list[Path]:
-    """Stage 2: Demosaic all buckets and stack intra-bucket subframes to Master FITS."""
+    """Stage 2: Demosaic all buckets and stack intra-bucket subframes to Master FITS & JPG."""
     bucket_dirs = sorted(work_path.glob("bucket_*"))
     if not bucket_dirs:
         raise FileNotFoundError(
@@ -44,7 +46,6 @@ def run_stack(
     master_paths: list[Path] = []
 
     if stacking_engine == "siril":
-        # Native Siril C engine handles registration & stacking per bucket on disk
         for b_path in bucket_dirs:
             exp_str = b_path.name.replace("bucket_", "")
             master_fit_name = f"Master_{exp_str}"
@@ -57,16 +58,19 @@ def run_stack(
                 sigma_low=sigma_low,
                 sigma_high=sigma_high,
             )
-            print(f"  [Saved] -> {master_fits_path.name}", flush=True)
+            master_img = load_fits_to_float32(master_fits_path)
+            jpg_out = b_path / f"{master_fit_name}.jpg"
+            save_preview_jpg(master_img, jpg_out)
+            print(f"  [Saved] -> {master_fits_path.name} & {jpg_out.name}", flush=True)
             master_paths.append(master_fits_path)
     else:
-        # Python engine: Demosaic via PySiril, then align & stack in memory
         bucket_fits_map = demosaic_all_buckets_with_siril(bucket_dirs)
 
         for b_path in bucket_dirs:
             exp_str = b_path.name.replace("bucket_", "")
             master_fit_name = f"Master_{exp_str}.fit"
             master_fits_path = b_path / master_fit_name
+            master_jpg_path = b_path / f"Master_{exp_str}.jpg"
 
             conv_fits_paths = bucket_fits_map.get(b_path, [])
             print(
@@ -79,14 +83,21 @@ def run_stack(
                 sigma_low=sigma_low,
                 sigma_high=sigma_high,
                 upsample_factor=100,
+                max_allowed_shift=max_shift,
             )
 
+            # Save 32-bit linear FITS
             fits.writeto(
                 master_fits_path,
                 np.transpose(master_img, (2, 0, 1)),
                 overwrite=True,
             )
-            print(f"  [Saved] -> {master_fits_path.name}", flush=True)
+            # Save 8-bit preview JPG
+            save_preview_jpg(master_img, master_jpg_path)
+            print(
+                f"  [Saved] -> {master_fits_path.name} & {master_jpg_path.name}",
+                flush=True,
+            )
             master_paths.append(master_fits_path)
 
     return master_paths
@@ -118,13 +129,18 @@ def run_align(work_path: Path) -> list[Path]:
     print("\n--- Saving Aligned Masters ---", flush=True)
     for aligned_img, src_path in zip(aligned_masters, master_files):
         out_aligned_path = src_path.parent / f"Aligned_{src_path.name}"
+        out_aligned_jpg = src_path.parent / f"Aligned_{src_path.stem}.jpg"
+
         fits.writeto(
             out_aligned_path,
             np.transpose(aligned_img, (2, 0, 1)),
             overwrite=True,
         )
+        save_preview_jpg(aligned_img, out_aligned_jpg)
         aligned_paths.append(out_aligned_path)
-        print(f"  * Saved: {out_aligned_path.name}", flush=True)
+        print(
+            f"  * Saved: {out_aligned_path.name} & {out_aligned_jpg.name}", flush=True
+        )
 
     return aligned_paths
 
@@ -197,6 +213,12 @@ def main() -> None:
         help="Intra-bucket stacking engine: 'python' (in-memory DFT cross-correlation) or 'siril' (native C engine)",
     )
     parser.add_argument(
+        "--max-shift",
+        type=float,
+        default=50.0,
+        help="Maximum allowable shift in pixels before a subframe is excluded as an outlier (default: 50.0px)",
+    )
+    parser.add_argument(
         "--sigma-low",
         type=float,
         default=3.0,
@@ -226,12 +248,6 @@ def main() -> None:
         default=0.2,
         help="Mertens well-exposedness weight",
     )
-    parser.add_argument(
-        "--max-shift",
-        type=float,
-        default=50.0,
-        help="Maximum allowable shift in pixels before a subframe is excluded as an outlier (default: 50.0px)",
-    )
 
     args = parser.parse_args()
     work_path = args.work_dir.resolve()
@@ -246,7 +262,13 @@ def main() -> None:
 
     if args.step == "all":
         run_sort(input_path, work_path)
-        run_stack(work_path, args.stacking_engine, args.sigma_low, args.sigma_high)
+        run_stack(
+            work_path,
+            args.stacking_engine,
+            args.sigma_low,
+            args.sigma_high,
+            args.max_shift,
+        )
         run_align(work_path)
         run_fuse(
             work_path,
@@ -260,7 +282,13 @@ def main() -> None:
         run_sort(input_path, work_path)
 
     elif args.step == "stack":
-        run_stack(work_path, args.stacking_engine, args.sigma_low, args.sigma_high)
+        run_stack(
+            work_path,
+            args.stacking_engine,
+            args.sigma_low,
+            args.sigma_high,
+            args.max_shift,
+        )
 
     elif args.step == "align":
         run_align(work_path)
