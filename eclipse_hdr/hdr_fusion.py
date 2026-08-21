@@ -28,10 +28,9 @@ def fuse_scientific_linear_radiance(
     aligned_masters: list[np.ndarray],
     master_names: list[str],
     output_path: Path,
-    sat_threshold: float = 0.92,
-    noise_sigma_mult: float = 3.0,
+    sat_threshold: float = 0.90,
 ) -> None:
-    """Reconstructs a photometric 32-bit linear radiance map using photon SNR weighting."""
+    """Reconstructs a photometric 32-bit linear radiance map using linear photon SNR weighting."""
     num_masters = len(aligned_masters)
     h, w, c = aligned_masters[0].shape
 
@@ -39,7 +38,7 @@ def fuse_scientific_linear_radiance(
     print("      SCIENTIFIC PHOTOMETRIC RADIANCE RECONSTRUCTION (LINEAR)     ", flush=True)
     print("=" * 65, flush=True)
     print(f"  * Brackets in Stack      : {num_masters} frames", flush=True)
-    print(f"  * Saturation Ceiling     : {sat_threshold:.2f} (Rejects non-linear well capacity)", flush=True)
+    print(f"  * Saturation Ceiling     : {sat_threshold:.2f}", flush=True)
     print("-" * 65, flush=True)
 
     numerator = np.zeros((h, w, c), dtype=np.float64)
@@ -48,46 +47,44 @@ def fuse_scientific_linear_radiance(
     for img, name in zip(aligned_masters, master_names):
         t_exp = parse_exposure_seconds(name)
 
-        # 1. Background pedestal and noise estimation from frame border
+        # 1. Channel-wise background estimation from image borders
         border_px = np.concatenate([
-            img[:20, :, :].ravel(),
-            img[-20:, :, :].ravel(),
-            img[:, :20, :].ravel(),
-            img[:, -20:, :].ravel(),
-        ])
-        bg = float(np.median(border_px))
-        bg_sigma = float(np.std(border_px)) or 1e-4
+            img[:20, :, :].reshape(-1, c),
+            img[-20:, :, :].reshape(-1, c),
+            img[:, :20, :].reshape(-1, c),
+            img[:, -20:, :].reshape(-1, c),
+        ], axis=0)
 
-        # Net linear flux above background
+        bg = np.median(border_px, axis=0)  # Shape (3,)
+
+        # Net linear flux above pedestal
         flux = np.maximum(0.0, img.astype(np.float64) - bg)
-        noise_floor = noise_sigma_mult * bg_sigma
 
-        # 2. Photometric Confidence Weight:
-        # Ramp up from noise floor, maintain high weight across linear range, taper smoothly before saturation
-        weight = np.where(
-            (flux > noise_floor) & (img < sat_threshold),
-            np.minimum(flux / (2.0 * noise_floor), 1.0) * np.clip((sat_threshold - img) / 0.05, 0.0, 1.0),
-            0.0,
-        ).astype(np.float64)
+        # 2. Continuous Weight Function:
+        # Rejects saturation, scales with SNR (proportional to flux * t_exp)
+        # Linear ramp near saturation to avoid hard boundary steps
+        sat_mask = np.clip((sat_threshold - img) / 0.05, 0.0, 1.0)
+        weight = np.where(img < sat_threshold, flux * sat_mask, 0.0).astype(np.float64)
 
-        # 3. Radiance rate (counts / second)
+        # Radiance rate in counts/second (photons / sec equivalent)
         radiance_rate = flux / t_exp
 
-        active_pixels = float(np.count_nonzero(weight > 0.01)) / float(weight.size) * 100.0
-        print(f"  * {name:22s} (t={t_exp:8.5f}s, bg={bg:.5f}) -> Active Signal Area: {active_pixels:5.2f}%", flush=True)
+        active_px_count = int(np.count_nonzero(weight > 1e-4))
+        print(f"  * {name:22s} (t={t_exp:8.5f}s, bg={np.mean(bg):.5f}) -> Active Non-Zero Pixels: {active_px_count:,}", flush=True)
 
         numerator += weight * radiance_rate
         denominator += weight
 
-    # 4. Handle pixels where all exposures saturated or all were below noise floor
-    valid_mask = denominator > 1e-8
-    fastest_idx = int(np.argmin([parse_exposure_seconds(n) for n in master_names]))
-    t_fast = parse_exposure_seconds(master_names[fastest_idx])
-    fastest_rate = np.maximum(0.0, aligned_masters[fastest_idx].astype(np.float64)) / t_fast
+    # 3. Handle regions:
+    # - Active pixels: weighted average
+    # - Saturated everywhere (inner core): fastest bracket radiance
+    # - Pure sky/Moon shadow (zero weight): 0.0
+    radiance_map = np.zeros((h, w, c), dtype=np.float32)
+    valid_mask = denominator > 1e-9
 
-    radiance_map = np.where(valid_mask, numerator / np.maximum(denominator, 1e-8), fastest_rate).astype(np.float32)
+    radiance_map[valid_mask] = (numerator[valid_mask] / denominator[valid_mask]).astype(np.float32)
 
-    # 5. Export 32-Bit FITS & TIFF
+    # 4. Save 32-bit FITS and TIFF
     fits_out = output_path.with_name(f"{output_path.stem}_Scientific_Linear.fits")
     fits.writeto(fits_out, np.transpose(radiance_map, (2, 0, 1)), overwrite=True)
     print(f"\n  [Exported 32-bit FITS Linear Radiance] -> {fits_out.resolve()}", flush=True)
@@ -96,17 +93,17 @@ def fuse_scientific_linear_radiance(
     tifffile.imwrite(str(tiff_out), radiance_map, photometric="rgb")
     print(f"  [Exported 32-bit TIFF Linear Radiance] -> {tiff_out.resolve()}", flush=True)
 
-    # 6. Photometric Density Log10 Preview
+    # 5. Scientific Preview (Asinh Density Stretch)
     preview_jpg = output_path.with_name(f"{output_path.stem}_Scientific_Preview.jpg")
-    positive_vals = radiance_map[radiance_map > 0]
-    p_low = float(np.percentile(positive_vals, 5.0)) if positive_vals.size else 1.0
-    p_high = float(np.percentile(positive_vals, 99.95)) if positive_vals.size else 1e6
+    p99_val = float(np.percentile(radiance_map[radiance_map > 0], 99.9)) if np.any(radiance_map > 0) else 1.0
+    norm_rad = np.clip(radiance_map / max(p99_val, 1e-4), 0.0, 1.0)
 
-    log_map = np.log10(np.clip(radiance_map, p_low, p_high))
-    norm_log = np.clip((log_map - np.log10(p_low)) / (np.log10(p_high) - np.log10(p_low)), 0.0, 1.0)
-    preview_8u = (norm_log * 255.0).astype(np.uint8)
+    beta = 50.0
+    stretched = np.arcsinh(norm_rad * beta) / np.arcsinh(beta)
+    preview_8u = (np.clip(stretched, 0.0, 1.0) * 255.0).astype(np.uint8)
+
     Image.fromarray(preview_8u, mode="RGB").save(preview_jpg, quality=95)
-    print(f"  [Exported Log10 Radiance Preview JPG]  -> {preview_jpg.resolve()}", flush=True)
+    print(f"  [Exported Scientific Preview JPG]      -> {preview_jpg.resolve()}", flush=True)
     print("=" * 65 + "\n", flush=True)
 
 def fuse_artistic_mertens(
