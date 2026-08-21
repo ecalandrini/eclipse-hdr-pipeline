@@ -11,6 +11,13 @@ def demosaic_bucket_with_siril(bucket_dir: Path) -> list[Path]:
     files to 32-bit linear FITS sequences for in-memory processing.
     """
     b_path = bucket_dir.resolve()
+    conv_dir = b_path / "conv"
+
+    # Check if demosaiced frames already exist from a previous run
+    existing_fits = sorted(conv_dir.glob("*.fit")) + sorted(conv_dir.glob("*.fits"))
+    if existing_fits:
+        return existing_fits
+
     app = Siril()
     try:
         app.Open()
@@ -19,23 +26,34 @@ def demosaic_bucket_with_siril(bucket_dir: Path) -> list[Path]:
         # Set working directory inside Siril
         cmd.cd(str(b_path))
 
-        # Demosaic RAW files (convertraw or convert light -debayer -out=conv)
+        # Demosaic RAW files
         try:
             cmd.convertraw("light", debayer=True, out="conv")
         except (AttributeError, Exception):
             app.Send("convertraw light -debayer -out=conv")
 
-        fits_files = sorted(b_path.glob("conv_*.fit"))
+        # Search for any FITS produced inside conv/ or in the bucket root
+        fits_files = (
+            sorted(conv_dir.glob("*.fit"))
+            + sorted(conv_dir.glob("*.fits"))
+            + sorted(b_path.glob("light_*.fit"))
+            + sorted(b_path.glob("conv_*.fit"))
+        )
+
         if not fits_files:
+            # Fallback if needed
             try:
                 cmd.convert("light", debayer=True, out="conv")
             except (AttributeError, Exception):
                 app.Send("convert light -debayer -out=conv")
-            fits_files = sorted(b_path.glob("conv_*.fit"))
+
+            fits_files = sorted(conv_dir.glob("*.fit")) + sorted(
+                conv_dir.glob("*.fits")
+            )
 
         if not fits_files:
             raise FileNotFoundError(
-                f"Siril debayer conversion failed: no FITS files found in {b_path.name}"
+                f"Siril debayer conversion failed: no FITS files found in {conv_dir}"
             )
         return fits_files
     finally:
@@ -63,50 +81,45 @@ def register_and_stack_with_siril(
 
         cmd.cd(str(b_path))
 
-        # 1. Demosaic RAW sequence to 32-bit linear FITS
+        # 1. Demosaic RAW sequence
         try:
             cmd.convertraw("light", debayer=True, out="conv")
         except (AttributeError, Exception):
             app.Send("convertraw light -debayer -out=conv")
 
-        fits_files = sorted(b_path.glob("conv_*.fit"))
-        if not fits_files:
-            try:
-                cmd.convert("light", debayer=True, out="conv")
-            except (AttributeError, Exception):
-                app.Send("convert light -debayer -out=conv")
+        conv_dir = b_path / "conv"
+        fits_files = sorted(conv_dir.glob("*.fit")) + sorted(conv_dir.glob("*.fits"))
 
         # If only 1 frame exists in the bucket, save directly as master
-        if len(raw_files) == 1:
-            try:
-                cmd.load("conv_00001.fit")
-                cmd.save(output_master_name)
-            except (AttributeError, Exception):
-                app.Send("load conv_00001.fit")
-                app.Send(f"save {output_master_name}")
-            return b_path / f"{output_master_name}.fit"
+        if len(raw_files) == 1 and fits_files:
+            master_path = b_path / f"{output_master_name}.fit"
+            fits_files[0].rename(master_path)
+            return master_path
 
-        # 2. Register sequence using 2-pass translation (shift-only)
+        # 2. Change working dir into conv/ for registration and stacking
+        cmd.cd(str(conv_dir))
+
+        # Register sequence using 2-pass translation (shift-only)
         try:
-            cmd.register("conv", two_pass=True, transf="shift")
-            cmd.seqapplyreg("conv", framing="current")
+            cmd.register("light", two_pass=True, transf="shift")
+            cmd.seqapplyreg("light", framing="current")
         except (AttributeError, Exception):
-            app.Send("register conv -2pass -transf=shift")
-            app.Send("seqapplyreg conv -framing=current")
+            app.Send("register light -2pass -transf=shift")
+            app.Send("seqapplyreg light -framing=current")
 
         # 3. Stack with Winsorized Sigma Clipping and additive normalization
         try:
             cmd.stack(
-                "r_conv",
+                "r_light",
                 type="rej",
                 low=sigma_low,
                 high=sigma_high,
                 norm="add",
-                out=output_master_name,
+                out=f"../{output_master_name}",
             )
         except (AttributeError, Exception):
             app.Send(
-                f"stack r_conv rej {sigma_low} {sigma_high} -norm=add -out={output_master_name}"
+                f"stack r_light rej {sigma_low} {sigma_high} -norm=add -out=../{output_master_name}"
             )
 
         master_path = b_path / f"{output_master_name}.fit"
