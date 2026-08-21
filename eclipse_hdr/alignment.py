@@ -282,57 +282,114 @@ def extract_limb_edges_parabolic(
     return np.array(edge_points) if edge_points else np.empty((0, 2))
 
 
+def apply_spatial_shift_rgb(
+    img_rgb: np.ndarray, shift_y: float, shift_x: float
+) -> np.ndarray:
+    """Applies sub-pixel 2D translation in the spatial domain using spline interpolation
+
+    with zero-padding, preventing any Fourier circular wrap-around artifacts.
+    """
+    if abs(shift_y) < 0.01 and abs(shift_x) < 0.01:
+        return img_rgb
+
+    shifted_rgb = np.zeros_like(img_rgb)
+    for c in range(3):
+        # order=3 (bicubic spline) with constant 0.0 boundary padding
+        shifted_rgb[:, :, c] = ndimage.shift(
+            img_rgb[:, :, c],
+            shift=(shift_y, shift_x),
+            order=3,
+            mode="constant",
+            cval=0.0,
+        )
+
+    return np.clip(shifted_rgb, 0.0, 1.0)
+
+
 def align_masters_taubin(
     masters: list[np.ndarray],
     master_names: list[str],
     ref_idx: int = 0,
+    max_inter_master_shift: float = 120.0,
 ) -> list[np.ndarray]:
-    """Aligns all bracket master frames to the lunar limb centroid of the reference master."""
+    """Aligns all bracket master frames to the lunar limb centroid of the reference master
+
+    with spatial boundary padding and outlier clamping.
+    """
     print(
         f"\n--- [Stage 3] Inter-Master Sub-Pixel Limb Alignment (Ref: {master_names[ref_idx]}) ---",
         flush=True,
     )
     h, w, _ = masters[ref_idx].shape
-    ref_lum = np.mean(masters[ref_idx], axis=2)
+    ref_lum = (
+        0.299 * masters[ref_idx][:, :, 0]
+        + 0.587 * masters[ref_idx][:, :, 1]
+        + 0.114 * masters[ref_idx][:, :, 2]
+    )
 
     center_est = (w / 2.0, h / 2.0)
     r_est = min(h, w) * 0.22
 
+    # 1. Detect Lunar Limb on Reference Master
     ref_edges = extract_limb_edges_parabolic(ref_lum, center_est, r_est)
-    if len(ref_edges) < 20:
-        print(
-            "  [Warning] Insufficient limb edge contrast in reference. Using image center as origin.",
-            flush=True,
-        )
-        ref_cx, ref_cy = center_est
-    else:
+    if len(ref_edges) >= 30:
         ref_cx, ref_cy, _ = fit_circle_taubin(ref_edges)
         print(
-            f"  * Reference Lunar Centroid: (cx={ref_cx:.2f}, cy={ref_cy:.2f})",
+            f"  * Reference Lunar Centroid (Taubin): (cx={ref_cx:.2f}, cy={ref_cy:.2f})",
+            flush=True,
+        )
+    else:
+        ref_cx, ref_cy = center_est
+        print(
+            f"  * Reference Centroid (Fallback Origin): (cx={ref_cx:.2f}, cy={ref_cy:.2f})",
             flush=True,
         )
 
+    # 2. Windowed Reference for Phase Cross-Correlation Fallback
+    ref_small = ref_lum[::2, ::2]
+    win = np.outer(
+        np.hanning(ref_small.shape[0]), np.hanning(ref_small.shape[1])
+    ).astype(np.float32)
+    ref_win = ref_small * win
+
     aligned_masters = []
+
     for img, name in zip(masters, master_names):
-        lum = np.mean(img, axis=2)
+        lum = 0.299 * img[:, :, 0] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 2]
         edges = extract_limb_edges_parabolic(lum, (ref_cx, ref_cy), r_est)
 
-        if len(edges) < 20:
+        if len(edges) >= 30:
+            cx, cy, _ = fit_circle_taubin(edges)
+            dx = float(ref_cx - cx)
+            dy = float(ref_cy - cy)
+            method = "Taubin Limb Fit"
+        else:
+            # Fallback to 2x binned windowed phase cross-correlation
+            lum_small = lum[::2, ::2] * win
+            shift, _, _ = phase_cross_correlation(
+                ref_win, lum_small, upsample_factor=100
+            )
+            dy = float(shift[0] * 2.0)
+            dx = float(shift[1] * 2.0)
+            method = "Phase Correlation"
+
+        dist = float(np.hypot(dx, dy))
+
+        # Guard against wild false correlation peaks
+        if dist > max_inter_master_shift:
             print(
-                f"  * {name}: Limb too faint/saturated -> Phase correlation fallback.",
+                f"  * {name} -> [CLAMPED OUTLIER] Shift {dist:.2f}px via {method} exceeded limit {max_inter_master_shift:.1f}px (dy={dy:+.2f}px, dx={dx:+.2f}px). Resetting to (0, 0).",
                 flush=True,
             )
-            shift, _, _ = phase_cross_correlation(
-                ref_lum[::2, ::2], lum[::2, ::2], upsample_factor=100
-            )
-            dy, dx = shift[0] * 2.0, shift[1] * 2.0
+            dy, dx = 0.0, 0.0
         else:
-            cx, cy, _ = fit_circle_taubin(edges)
-            dx = ref_cx - cx
-            dy = ref_cy - cy
+            print(
+                f"  * {name} -> Shift: (dy={dy:+.2f}px, dx={dx:+.2f}px, dist={dist:.2f}px) [{method}]",
+                flush=True,
+            )
 
-        print(f"  * {name} -> Offset: (dy={dy:+.2f}px, dx={dx:+.2f}px)", flush=True)
-        shifted = apply_fourier_shift_rgb(img, dy, dx)
+        # Apply spatial shift with zero-padding (NO periodic wrap-around)
+        shifted = apply_spatial_shift_rgb(img, dy, dx)
         aligned_masters.append(shifted)
 
     return aligned_masters
