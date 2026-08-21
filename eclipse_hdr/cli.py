@@ -19,7 +19,7 @@ from .siril_bridge import (
     demosaic_all_buckets_with_siril,
     register_and_stack_with_siril,
 )
-
+from eclipse_hdr.post_processing import process_coronal_features
 
 def run_sort(input_path: Path, work_path: Path) -> dict[str, Path]:
     """Stage 1: Scan EXIF and bucket sort raw frames."""
@@ -281,6 +281,19 @@ def main() -> None:
         default="both",
         help="HDR fusion mode: 'scientific' (linear radiance), 'artistic' (Mertens pyramid), or 'both' (default: both)",
     )
+    parser.add_argument(
+        "--step",
+        type=str,
+        choices=["all", "sort", "stack", "align", "fuse", "postprocess"],
+        default="all",
+        help="Execution step: 'sort', 'stack', 'align', 'fuse', 'postprocess', or 'all'",
+    )
+    parser.add_argument(
+        "--sharpen",
+        type=float,
+        default=1.8,
+        help="Unsharp mask sharpening strength for coronal loops (default: 1.8)",
+    ) 
     
     args = parser.parse_args()
     work_path = args.work_dir.resolve()
@@ -334,6 +347,16 @@ def main() -> None:
             args.contrast_weight,
             args.sat_weight,
             args.exp_weight,
+        )
+    
+    elif args.step == "postprocess":
+        target_master = output_path.with_name(f"{output_path.stem}_Artistic_HDR.tif")
+        if not target_master.exists():
+            target_master = output_path
+        process_coronal_features(
+            input_master_path=target_master,
+            output_dir=work_path,
+            sharpen_amount=args.sharpen,
         )
 
 
