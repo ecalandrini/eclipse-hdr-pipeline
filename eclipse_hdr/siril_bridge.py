@@ -16,16 +16,21 @@ def demosaic_bucket_with_siril(bucket_dir: Path) -> list[Path]:
         app.Open()
         cmd = Wrapper(app)
 
-        # Change working directory inside Siril
+        # Set working directory inside Siril
         cmd.cd(str(b_path))
 
-        # Convert raw sequence to 32-bit demosaiced FITS sequence (conv_00001.fit, etc.)
-        cmd.Send("convertraw light -debayer -out=conv")
+        # Demosaic RAW files (convertraw or convert light -debayer -out=conv)
+        try:
+            cmd.convertraw("light", debayer=True, out="conv")
+        except (AttributeError, Exception):
+            app.Send("convertraw light -debayer -out=conv")
 
         fits_files = sorted(b_path.glob("conv_*.fit"))
         if not fits_files:
-            # Fallback if the Siril build uses standard convert for raws in the active directory
-            cmd.Send("convert light -debayer -out=conv")
+            try:
+                cmd.convert("light", debayer=True, out="conv")
+            except (AttributeError, Exception):
+                app.Send("convert light -debayer -out=conv")
             fits_files = sorted(b_path.glob("conv_*.fit"))
 
         if not fits_files:
@@ -58,26 +63,51 @@ def register_and_stack_with_siril(
 
         cmd.cd(str(b_path))
 
-        # 1. Demosaic RAW files to 32-bit linear FITS sequence
-        cmd.Send("convertraw light -debayer -out=conv")
+        # 1. Demosaic RAW sequence to 32-bit linear FITS
+        try:
+            cmd.convertraw("light", debayer=True, out="conv")
+        except (AttributeError, Exception):
+            app.Send("convertraw light -debayer -out=conv")
+
         fits_files = sorted(b_path.glob("conv_*.fit"))
         if not fits_files:
-            cmd.Send("convert light -debayer -out=conv")
+            try:
+                cmd.convert("light", debayer=True, out="conv")
+            except (AttributeError, Exception):
+                app.Send("convert light -debayer -out=conv")
 
-        # If only 1 frame exists in the bucket, load and save as master
+        # If only 1 frame exists in the bucket, save directly as master
         if len(raw_files) == 1:
-            cmd.Send("load conv_00001.fit")
-            cmd.Send(f"save {output_master_name}")
+            try:
+                cmd.load("conv_00001.fit")
+                cmd.save(output_master_name)
+            except (AttributeError, Exception):
+                app.Send("load conv_00001.fit")
+                app.Send(f"save {output_master_name}")
             return b_path / f"{output_master_name}.fit"
 
         # 2. Register sequence using 2-pass translation (shift-only)
-        cmd.Send("register conv -2pass -transf=shift")
-        cmd.Send("seqapplyreg conv -framing=current")
+        try:
+            cmd.register("conv", two_pass=True, transf="shift")
+            cmd.seqapplyreg("conv", framing="current")
+        except (AttributeError, Exception):
+            app.Send("register conv -2pass -transf=shift")
+            app.Send("seqapplyreg conv -framing=current")
 
         # 3. Stack with Winsorized Sigma Clipping and additive normalization
-        cmd.Send(
-            f"stack r_conv rej {sigma_low} {sigma_high} -norm=add -out={output_master_name}"
-        )
+        try:
+            cmd.stack(
+                "r_conv",
+                type="rej",
+                low=sigma_low,
+                high=sigma_high,
+                norm="add",
+                out=output_master_name,
+            )
+        except (AttributeError, Exception):
+            app.Send(
+                f"stack r_conv rej {sigma_low} {sigma_high} -norm=add -out={output_master_name}"
+            )
 
         master_path = b_path / f"{output_master_name}.fit"
         if not master_path.exists():
