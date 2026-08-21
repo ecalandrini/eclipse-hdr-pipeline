@@ -53,6 +53,31 @@ Or switch to Siril's native C disk-based engine:
 uv run eclipse-hdr -i /path/to/raw_raf_files --stacking-engine siril -o ./Eclipse_HDR_Master.tif
 ```
 
+How to run step-by-step:
+
+```bash
+# 1. Sort files into buckets
+uv run eclipse-hdr --step sort -i /path/to/raws -w ./workspace
+
+# 2. Demosaic and stack brackets (inspect Master_*.fit files in Siril / DS9 if desired)
+uv run eclipse-hdr --step stack -w ./workspace --stacking-engine python
+
+# 3. Fit lunar limb circles and Fourier shift all masters to common center
+uv run eclipse-hdr --step align -w ./workspace
+
+# 4. Tweak fusion weights without re-stacking or re-aligning
+uv run eclipse-hdr --step fuse -w ./workspace --contrast-weight 2.0 --exp-weight 0.0 -o ./output_punchy.tif
+uv run eclipse-hdr --step fuse -w ./workspace --contrast-weight 0.8 --exp-weight 0.3 -o ./output_natural.tif
+```
+
+> **Note!** 
+Currently, **Taubin Alignment** (Algorithm 2) and **Mertens Fusion** (Step 5) expect in-memory Python objects (`stacked_masters`, `aligned_masters`) passed directly from previous loop iterations. If you exit after stacking, those arrays are lost unless written to disk.
+>To make stages independent:
+>* `sort`: Reads raw `.RAF`, creates `bucket_<exp>`/ folders.
+>* `stack`: Reads `bucket_<exp>/*.RAF`, demosaics, stacks, and writes `Master_<exp>.fit`.
+>* `align`: Reads all `Master_<exp>.fit` files, fits Taubin centroids, shifts via Fourier, and saves `Aligned_Master_<exp>.fit`.
+>* `fuse`: Reads all `Aligned_Master_*.fit` files, runs Mertens pyramid fusion, and exports the final 16-bit TIFF.
+
 ## CLI Options
 | Flag | Shorthand | Default | Description |
 | :--- | :--- | :--- | :--- |
