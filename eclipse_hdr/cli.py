@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 from astropy.io import fits
 import numpy as np
+import gc
 
 from eclipse_hdr.alignment import (
     align_and_stack_bucket_dft,
