@@ -127,10 +127,10 @@ def run_stack(
 
 
 def run_align(work_path: Path) -> list[Path]:
-    """Stage 3: Inter-master Taubin circle fitting and Fourier registration.
+    """Stage 3: Inter-master graph feature alignment.
 
-    Skips buckets that already contain an 'Aligned_Master_*.fit' file, while using
-    the global reference master to keep the coordinate origin consistent.
+    Loads all master FITS, registers them via high-pass correlation graph,
+    and saves Aligned_Master_*.fit files.
     """
     master_files = sorted(work_path.glob("bucket_*/Master_*.fit"))
     if not master_files:
@@ -138,72 +138,51 @@ def run_align(work_path: Path) -> list[Path]:
             f"No Master_*.fit files found in {work_path}. Run '--step stack' first."
         )
 
-    # 1. Establish reference frame (using standard middle/representative exposure bracket)
-    ref_idx = min(len(master_files) - 1, 4)
-    ref_file = master_files[ref_idx]
     print(
-        f"\n--- [Stage 3] Inter-Master Alignment (Global Reference: {ref_file.parent.name}/{ref_file.name}) ---",
+        f"\n--- [Stage 3] Inter-Master Graph Alignment ({len(master_files)} Masters Found) ---",
         flush=True,
     )
 
-    # 2. Find which buckets need alignment
-    pending_files: list[Path] = []
-    for mf in master_files:
-        aligned_fit = mf.parent / f"Aligned_{mf.name}"
-        if aligned_fit.exists():
-            print(
-                f"[{mf.parent.name}] Aligned master already exists ({aligned_fit.name}). Skipping.",
-                flush=True,
-            )
-        else:
-            pending_files.append(mf)
+    # 1. Load all master images into memory
+    print("  * Loading master FITS frames...", flush=True)
+    stacked_masters = [load_fits_to_float32(p) for p in master_files]
+    master_names = [p.stem for p in master_files]
 
-    if not pending_files:
-        print(
-            "\nAll buckets already have Aligned_Master FITS files. Nothing to align.",
-            flush=True,
-        )
-        return sorted(work_path.glob("bucket_*/Aligned_Master_*.fit"))
-
+    # 2. Select anchor frame: Pick the exposure with the highest mean coronal signal (e.g., 1/15s)
+    mean_intensities = [float(np.mean(m)) for m in stacked_masters]
+    anchor_idx = int(np.argmax(mean_intensities))
     print(
-        f"\nAligning {len(pending_files)}/{len(master_files)} pending bucket masters...",
+        f"  * Selected Solar Anchor: {master_names[anchor_idx]} (Highest Signal-to-Noise)",
         flush=True,
     )
 
-    # Load reference master
-    ref_master_img = load_fits_to_float32(ref_file)
+    # 3. Run global feature graph alignment
+    aligned_masters = align_masters_graph(
+        masters=stacked_masters,
+        master_names=master_names,
+        anchor_idx=anchor_idx,
+    )
 
-    # Align each pending master against the global reference
+    # 4. Save aligned masters
     aligned_paths: list[Path] = []
-    for mf in pending_files:
-        target_img = load_fits_to_float32(mf)
+    print("\n--- Saving Aligned Masters ---", flush=True)
+    for aligned_img, src_path in zip(aligned_masters, master_files):
+        out_aligned_path = src_path.parent / f"Aligned_{src_path.name}"
+        out_aligned_jpg = src_path.parent / f"Aligned_{src_path.stem}.jpg"
 
-        # align_masters_taubin aligns targets to the reference at index 0
-        aligned_pair = align_masters_taubin(
-            masters=[ref_master_img, target_img],
-            master_names=[ref_file.stem, mf.stem],
-            ref_idx=0,
-        )
-        aligned_img = aligned_pair[1]
-
-        out_aligned_path = mf.parent / f"Aligned_{mf.name}"
-        out_aligned_jpg = mf.parent / f"Aligned_{mf.stem}.jpg"
-
-        # Save 32-bit linear FITS
         fits.writeto(
             out_aligned_path,
             np.transpose(aligned_img, (2, 0, 1)),
             overwrite=True,
         )
-        # Save tonemapped preview JPG
         save_preview_jpg(aligned_img, out_aligned_jpg)
         aligned_paths.append(out_aligned_path)
         print(
-            f"  [Saved] -> {mf.parent.name}/{out_aligned_path.name} & {out_aligned_jpg.name}",
+            f"  * Saved: {src_path.parent.name}/{out_aligned_path.name} & {out_aligned_jpg.name}",
             flush=True,
         )
 
-    return sorted(work_path.glob("bucket_*/Aligned_Master_*.fit"))
+    return aligned_paths
 
 
 def run_fuse(
