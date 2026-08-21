@@ -4,16 +4,16 @@ import gc
 from pathlib import Path
 from astropy.io import fits
 import numpy as np
+from PIL import Image
 from scipy import ndimage
 from skimage.registration import phase_cross_correlation
 
 
 def load_fits_to_float32(fits_path: Path) -> np.ndarray:
     """Loads a FITS file and returns an (H, W, C) float32 RGB array normalized to [0.0, 1.0]."""
-    with fits.open(fits_path) as hdul:
+    with fits.open(fits_path, memmap=True) as hdul:
         data = hdul[0].data.astype(np.float32)
 
-    # Convert from FITS (C, H, W) to standard image (H, W, C)
     if data.ndim == 3:
         if data.shape[0] == 3:
             img = np.transpose(data, (1, 2, 0))
@@ -26,7 +26,6 @@ def load_fits_to_float32(fits_path: Path) -> np.ndarray:
 
     max_val = np.max(img)
     if max_val > 1.0:
-        # 16-bit ADU normalization
         if max_val > 255.0:
             img /= 65535.0
         else:
@@ -35,11 +34,22 @@ def load_fits_to_float32(fits_path: Path) -> np.ndarray:
     return np.clip(img, 0.0, 1.0)
 
 
+def save_preview_jpg(
+    img_float32: np.ndarray, output_jpg_path: Path, gamma: float = 2.2
+) -> None:
+    """Saves a tonemapped 8-bit sRGB JPEG preview of a linear master frame."""
+    # Midtone stretch / Gamma correction for visual inspection
+    stretched = np.power(np.clip(img_float32, 0.0, 1.0), 1.0 / gamma)
+    img_8bit = (stretched * 255.0).astype(np.uint8)
+    pil_img = Image.fromarray(img_8bit, mode="RGB")
+    pil_img.save(output_jpg_path, quality=92)
+
+
 def apply_fourier_shift_rgb(
     img_rgb: np.ndarray, shift_y: float, shift_x: float
 ) -> np.ndarray:
     """Applies sub-pixel 2D translation across all 3 color channels in Fourier space."""
-    if abs(shift_y) < 1e-4 and abs(shift_x) < 1e-4:
+    if abs(shift_y) < 0.05 and abs(shift_x) < 0.05:
         return img_rgb
 
     shifted_rgb = np.zeros_like(img_rgb)
@@ -59,41 +69,32 @@ def align_and_stack_bucket_dft(
     upsample_factor: int = 100,
     max_allowed_shift: float = 50.0,
 ) -> np.ndarray:
-    """Memory-safe intra-bucket sub-pixel DFT alignment & 2-pass streaming sigma-clip stacking.
-
-    Excludes frames whose Euclidean shift distance exceeds `max_allowed_shift` (in pixels).
-    Keeps resident memory strictly under 200 MB regardless of frame count.
-    """
+    """High-speed single-pass intra-bucket DFT alignment and sigma-clipped stacking."""
     num_frames = len(fits_paths)
     if num_frames == 0:
         raise ValueError("No FITS paths provided for stacking.")
 
-    # Single frame shortcut
     if num_frames == 1:
         print("  * Single frame bucket: skipping alignment.", flush=True)
         return load_fits_to_float32(fits_paths[0])
 
-    # 1. Load reference frame (first frame)
     print(f"  * Loading reference frame: {fits_paths[0].name}", flush=True)
     ref_img = load_fits_to_float32(fits_paths[0])
     h, w, _ = ref_img.shape
 
-    # Fast 2x downsampled luminance for phase cross-correlation
+    # Fast 2x binned luminance for phase cross-correlation
     ref_lum_small = (
         0.299 * ref_img[::2, ::2, 0]
         + 0.587 * ref_img[::2, ::2, 1]
         + 0.114 * ref_img[::2, ::2, 2]
     )
-
-    # Apply 2D Hann window to prevent edge wrap-around false correlation peaks
     win_y = np.hanning(ref_lum_small.shape[0])
     win_x = np.hanning(ref_lum_small.shape[1])
     window_2d = np.outer(win_y, win_x).astype(np.float32)
     ref_lum_win = ref_lum_small * window_2d
 
-    # Calculate shifts for all candidate frames
-    raw_shifts: list[tuple[float, float]] = [(0.0, 0.0)]
-    all_distances: list[float] = [0.0]
+    # List of valid in-memory aligned frames
+    valid_frames: list[np.ndarray] = [ref_img]
 
     for i in range(1, num_frames):
         sub_img = load_fits_to_float32(fits_paths[i])
@@ -111,84 +112,52 @@ def align_and_stack_bucket_dft(
         shift_y, shift_x = float(shift[0] * 2.0), float(shift[1] * 2.0)
         dist = float(np.hypot(shift_x, shift_y))
 
-        raw_shifts.append((shift_y, shift_x))
-        all_distances.append(dist)
-        del sub_img
-
-    del ref_img, ref_lum_small, ref_lum_win, window_2d
-    gc.collect()
-
-    # 2. Filter out frames exceeding max allowable shift
-    valid_paths: list[Path] = []
-    valid_shifts: list[tuple[float, float]] = []
-
-    for i, (p, (sy, sx), dist) in enumerate(zip(fits_paths, raw_shifts, all_distances)):
         if dist > max_allowed_shift:
             print(
-                f"    [{i + 1}/{num_frames}] {p.name} -> [EXCLUDED] Shift {dist:.2f}px exceeds threshold {max_allowed_shift:.1f}px (dy={sy:+.2f}px, dx={sx:+.2f}px)",
+                f"    [{i + 1}/{num_frames}] {fits_paths[i].name} -> [EXCLUDED] Shift {dist:.2f}px exceeds limit {max_allowed_shift:.1f}px (dy={shift_y:+.2f}px, dx={shift_x:+.2f}px)",
                 flush=True,
             )
-        else:
-            print(
-                f"    [{i + 1}/{num_frames}] {p.name} -> [ACCEPTED] Shift: (dy={sy:+.2f}px, dx={sx:+.2f}px, dist={dist:.2f}px)",
-                flush=True,
-            )
-            valid_paths.append(p)
-            valid_shifts.append((sy, sx))
+            del sub_img
+            continue
 
-    n_valid = len(valid_paths)
-    print(
-        f"  * Stacking {n_valid}/{num_frames} accepted frames using streaming Winsorized sigma clipping...",
-        flush=True,
-    )
-
-    if n_valid == 0:
-        raise ValueError(
-            f"All frames in bucket exceeded the maximum shift threshold of {max_allowed_shift}px."
+        print(
+            f"    [{i + 1}/{num_frames}] {fits_paths[i].name} -> [ACCEPTED] Shift: (dy={shift_y:+.2f}px, dx={shift_x:+.2f}px, dist={dist:.2f}px)",
+            flush=True,
         )
 
-    if n_valid == 1:
-        return load_fits_to_float32(valid_paths[0])
+        shifted_sub = apply_fourier_shift_rgb(sub_img, shift_y, shift_x)
+        valid_frames.append(shifted_sub)
+        del sub_img
 
-    # --- PASS 1: Streaming Mean & Standard Deviation via Accumulators ---
-    sum_img = np.zeros((h, w, 3), dtype=np.float64)
-    sum_sq_img = np.zeros((h, w, 3), dtype=np.float64)
-
-    for p, (sy, sx) in zip(valid_paths, valid_shifts):
-        img = load_fits_to_float32(p)
-        shifted = apply_fourier_shift_rgb(img, sy, sx)
-        sum_img += shifted
-        sum_sq_img += shifted.astype(np.float64) ** 2
-        del img, shifted
-
-    mean = (sum_img / n_valid).astype(np.float32)
-    variance = np.maximum(0.0, (sum_sq_img / n_valid) - (mean.astype(np.float64) ** 2))
-    del sum_img, sum_sq_img
+    del ref_lum_small, ref_lum_win, window_2d
     gc.collect()
 
-    std = np.sqrt(variance).astype(np.float32)
+    n_valid = len(valid_frames)
+    print(f"  * Stacking {n_valid}/{num_frames} accepted frames...", flush=True)
+
+    if n_valid == 1:
+        return valid_frames[0]
+
+    # Convert list of 3D arrays to (N, H, W, C)
+    stack_array = np.stack(valid_frames, axis=0)
+    del valid_frames
+    gc.collect()
+
+    # Fast 1-pass SIMD Vectorized Sigma Clip
+    mean = np.mean(stack_array, axis=0, dtype=np.float32)
+    std = np.std(stack_array, axis=0, dtype=np.float32)
     std = np.where(std == 0, 1e-6, std)
-    del variance
 
     lower_bound = mean - (sigma_low * std)
     upper_bound = mean + (sigma_high * std)
     del std, mean
+
+    # In-place clipping and mean calculation
+    np.clip(stack_array, lower_bound, upper_bound, out=stack_array)
+    master_stacked = np.mean(stack_array, axis=0, dtype=np.float32)
+    del stack_array, lower_bound, upper_bound
     gc.collect()
 
-    # --- PASS 2: Streaming Winsorized Accumulation ---
-    final_accum = np.zeros((h, w, 3), dtype=np.float64)
-
-    for p, (sy, sx) in zip(valid_paths, valid_shifts):
-        img = load_fits_to_float32(p)
-        shifted = apply_fourier_shift_rgb(img, sy, sx)
-        winsorized = np.clip(shifted, lower_bound, upper_bound)
-        final_accum += winsorized
-        del img, shifted, winsorized
-
-    del lower_bound, upper_bound
-    gc.collect()
-
-    master_stacked = (final_accum / n_valid).astype(np.float32)
     return np.clip(master_stacked, 0.0, 1.0)
 
 
