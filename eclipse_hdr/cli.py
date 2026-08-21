@@ -127,45 +127,83 @@ def run_stack(
 
 
 def run_align(work_path: Path) -> list[Path]:
-    """Stage 3: Inter-master Taubin circle fitting and Fourier registration."""
+    """Stage 3: Inter-master Taubin circle fitting and Fourier registration.
+
+    Skips buckets that already contain an 'Aligned_Master_*.fit' file, while using
+    the global reference master to keep the coordinate origin consistent.
+    """
     master_files = sorted(work_path.glob("bucket_*/Master_*.fit"))
     if not master_files:
         raise FileNotFoundError(
             f"No Master_*.fit files found in {work_path}. Run '--step stack' first."
         )
 
+    # 1. Establish reference frame (using standard middle/representative exposure bracket)
+    ref_idx = min(len(master_files) - 1, 4)
+    ref_file = master_files[ref_idx]
     print(
-        f"\n--- [Stage 3] Inter-Master Alignment ({len(master_files)} Masters Found) ---",
+        f"\n--- [Stage 3] Inter-Master Alignment (Global Reference: {ref_file.parent.name}/{ref_file.name}) ---",
         flush=True,
     )
-    stacked_masters = [load_fits_to_float32(p) for p in master_files]
-    master_names = [p.stem for p in master_files]
 
-    ref_idx = min(len(stacked_masters) - 1, 4)
-    aligned_masters = align_masters_taubin(
-        masters=stacked_masters,
-        master_names=master_names,
-        ref_idx=ref_idx,
+    # 2. Find which buckets need alignment
+    pending_files: list[Path] = []
+    for mf in master_files:
+        aligned_fit = mf.parent / f"Aligned_{mf.name}"
+        if aligned_fit.exists():
+            print(
+                f"[{mf.parent.name}] Aligned master already exists ({aligned_fit.name}). Skipping.",
+                flush=True,
+            )
+        else:
+            pending_files.append(mf)
+
+    if not pending_files:
+        print(
+            "\nAll buckets already have Aligned_Master FITS files. Nothing to align.",
+            flush=True,
+        )
+        return sorted(work_path.glob("bucket_*/Aligned_Master_*.fit"))
+
+    print(
+        f"\nAligning {len(pending_files)}/{len(master_files)} pending bucket masters...",
+        flush=True,
     )
 
-    aligned_paths: list[Path] = []
-    print("\n--- Saving Aligned Masters ---", flush=True)
-    for aligned_img, src_path in zip(aligned_masters, master_files):
-        out_aligned_path = src_path.parent / f"Aligned_{src_path.name}"
-        out_aligned_jpg = src_path.parent / f"Aligned_{src_path.stem}.jpg"
+    # Load reference master
+    ref_master_img = load_fits_to_float32(ref_file)
 
+    # Align each pending master against the global reference
+    aligned_paths: list[Path] = []
+    for mf in pending_files:
+        target_img = load_fits_to_float32(mf)
+
+        # align_masters_taubin aligns targets to the reference at index 0
+        aligned_pair = align_masters_taubin(
+            masters=[ref_master_img, target_img],
+            master_names=[ref_file.stem, mf.stem],
+            ref_idx=0,
+        )
+        aligned_img = aligned_pair[1]
+
+        out_aligned_path = mf.parent / f"Aligned_{mf.name}"
+        out_aligned_jpg = mf.parent / f"Aligned_{mf.stem}.jpg"
+
+        # Save 32-bit linear FITS
         fits.writeto(
             out_aligned_path,
             np.transpose(aligned_img, (2, 0, 1)),
             overwrite=True,
         )
+        # Save tonemapped preview JPG
         save_preview_jpg(aligned_img, out_aligned_jpg)
         aligned_paths.append(out_aligned_path)
         print(
-            f"  * Saved: {out_aligned_path.name} & {out_aligned_jpg.name}", flush=True
+            f"  [Saved] -> {mf.parent.name}/{out_aligned_path.name} & {out_aligned_jpg.name}",
+            flush=True,
         )
 
-    return aligned_paths
+    return sorted(work_path.glob("bucket_*/Aligned_Master_*.fit"))
 
 
 def run_fuse(
