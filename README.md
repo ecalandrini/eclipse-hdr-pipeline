@@ -32,7 +32,7 @@ Optimized for high-dynamic-range solar eclipse sequences (e.g., Fujifilm 14-bit 
 Clone the repository and sync the virtual environment using `uv`:
 
 ```bash
-git clone [https://github.com/your-username/eclipse-hdr-pipeline.git](https://github.com/your-username/eclipse-hdr-pipeline.git)
+git clone [https://github.com/ecalandrini/eclipse-hdr-pipeline.git](https://github.com/ecalandrini/eclipse-hdr-pipeline.git)
 cd eclipse-hdr-pipeline
 
 # Creates .venv and locks dependencies from Git and PyPI
