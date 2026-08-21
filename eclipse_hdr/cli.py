@@ -31,15 +31,37 @@ def run_stack(
     sigma_high: float = 3.0,
     max_shift: float = 50.0,
 ) -> list[Path]:
-    """Stage 2: Demosaic all buckets and stack intra-bucket subframes to Master FITS & JPG."""
-    bucket_dirs = sorted(work_path.glob("bucket_*"))
-    if not bucket_dirs:
+    """Stage 2: Demosaic and stack intra-bucket subframes to Master FITS & JPG.
+
+    Skips any bucket folder that already contains a Master_*.fit file.
+    """
+    all_bucket_dirs = sorted(work_path.glob("bucket_*"))
+    if not all_bucket_dirs:
         raise FileNotFoundError(
             f"No bucket folders found in {work_path}. Run '--step sort' first."
         )
 
+    # Filter only bucket directories that do NOT have a Master_*.fit file
+    bucket_dirs: list[Path] = []
+    for b in all_bucket_dirs:
+        existing_masters = list(b.glob("Master_*.fit"))
+        if existing_masters:
+            print(
+                f"[{b.name}] Master already exists ({existing_masters[0].name}). Skipping.",
+                flush=True,
+            )
+        else:
+            bucket_dirs.append(b)
+
+    if not bucket_dirs:
+        print(
+            "\nAll buckets already have Master FITS files. Nothing to stack.",
+            flush=True,
+        )
+        return sorted(work_path.glob("bucket_*/Master_*.fit"))
+
     print(
-        f"\n--- [Stage 2] Intra-Bucket Stacking ({len(bucket_dirs)} Buckets) [Engine: {stacking_engine.upper()}] ---",
+        f"\n--- [Stage 2] Intra-Bucket Stacking ({len(bucket_dirs)}/{len(all_bucket_dirs)} Buckets to Process) [Engine: {stacking_engine.upper()}] ---",
         flush=True,
     )
 
@@ -64,6 +86,7 @@ def run_stack(
             print(f"  [Saved] -> {master_fits_path.name} & {jpg_out.name}", flush=True)
             master_paths.append(master_fits_path)
     else:
+        # Demosaic only the buckets that need processing
         bucket_fits_map = demosaic_all_buckets_with_siril(bucket_dirs)
 
         for b_path in bucket_dirs:
@@ -92,7 +115,7 @@ def run_stack(
                 np.transpose(master_img, (2, 0, 1)),
                 overwrite=True,
             )
-            # Save 8-bit preview JPG
+            # Save tonemapped preview JPG
             save_preview_jpg(master_img, master_jpg_path)
             print(
                 f"  [Saved] -> {master_fits_path.name} & {master_jpg_path.name}",
@@ -100,7 +123,7 @@ def run_stack(
             )
             master_paths.append(master_fits_path)
 
-    return master_paths
+    return sorted(work_path.glob("bucket_*/Master_*.fit"))
 
 
 def run_align(work_path: Path) -> list[Path]:
