@@ -12,10 +12,7 @@ from .alignment import (
 )
 from .exif_parser import sort_rafs_by_exposure
 from .hdr_fusion import fuse_and_export_hdr
-from .siril_bridge import (
-    demosaic_bucket_with_siril,
-    register_and_stack_with_siril,
-)
+from .siril_bridge import demosaic_all_buckets_with_siril
 
 
 def run_sort(input_path: Path, work_path: Path) -> dict[str, Path]:
@@ -25,55 +22,50 @@ def run_sort(input_path: Path, work_path: Path) -> dict[str, Path]:
 
 def run_stack(
     work_path: Path,
-    stacking_engine: str = "python",
     sigma_low: float = 3.0,
     sigma_high: float = 3.0,
 ) -> list[Path]:
-    """Stage 2: Demosaic and stack intra-bucket subframes to Master FITS."""
+    """Stage 2: Demosaic all buckets and stack intra-bucket subframes to Master FITS."""
     bucket_dirs = sorted(work_path.glob("bucket_*"))
     if not bucket_dirs:
         raise FileNotFoundError(
             f"No bucket folders found in {work_path}. Run '--step sort' first."
         )
 
-    master_paths: list[Path] = []
     print(
-        f"\n--- [Stage 2] Intra-Bucket Stacking [Engine: {stacking_engine.upper()}] ---"
+        f"\n--- [Stage 2] Intra-Bucket Stacking ({len(bucket_dirs)} Buckets) ---",
+        flush=True,
     )
 
+    # 1. Demosaic all buckets in a single Siril session
+    bucket_fits_map = demosaic_all_buckets_with_siril(bucket_dirs)
+
+    master_paths: list[Path] = []
+
+    # 2. Stack each bucket using Python Sub-pixel DFT + MAD Sigma Clipping
     for b_path in bucket_dirs:
         exp_str = b_path.name.replace("bucket_", "")
-        master_fit_name = f"Master_{exp_str}"
-        master_fits_path = b_path / f"{master_fit_name}.fit"
+        master_fit_name = f"Master_{exp_str}.fit"
+        master_fits_path = b_path / master_fit_name
 
-        if stacking_engine == "python":
-            print(f"\n[{b_path.name}] Demosaicing with PySiril...")
-            conv_fits_paths = demosaic_bucket_with_siril(b_path)
+        conv_fits_paths = bucket_fits_map.get(b_path, [])
+        print(
+            f"\n[{b_path.name}] Stacking {len(conv_fits_paths)} frames...", flush=True
+        )
 
-            print(
-                f"[{b_path.name}] Python DFT Sub-Pixel Stacking ({len(conv_fits_paths)} frames)..."
-            )
-            master_img = align_and_stack_bucket_dft(
-                fits_paths=conv_fits_paths,
-                sigma_low=sigma_low,
-                sigma_high=sigma_high,
-                upsample_factor=100,
-            )
+        master_img = align_and_stack_bucket_dft(
+            fits_paths=conv_fits_paths,
+            sigma_low=sigma_low,
+            sigma_high=sigma_high,
+            upsample_factor=100,
+        )
 
-            fits.writeto(
-                master_fits_path,
-                np.transpose(master_img, (2, 0, 1)),
-                overwrite=True,
-            )
-        else:
-            print(f"\n[{b_path.name}] Siril Native Registration & Stacking on Disk...")
-            master_fits_path = register_and_stack_with_siril(
-                bucket_dir=b_path,
-                output_master_name=master_fit_name,
-                sigma_low=sigma_low,
-                sigma_high=sigma_high,
-            )
-
+        fits.writeto(
+            master_fits_path,
+            np.transpose(master_img, (2, 0, 1)),
+            overwrite=True,
+        )
+        print(f"  [Saved] -> {master_fits_path.name}", flush=True)
         master_paths.append(master_fits_path)
 
     return master_paths
@@ -87,6 +79,10 @@ def run_align(work_path: Path) -> list[Path]:
             f"No Master_*.fit files found in {work_path}. Run '--step stack' first."
         )
 
+    print(
+        f"\n--- [Stage 3] Inter-Master Alignment ({len(master_files)} Masters Found) ---",
+        flush=True,
+    )
     stacked_masters = [load_fits_to_float32(p) for p in master_files]
     master_names = [p.stem for p in master_files]
 
@@ -98,7 +94,7 @@ def run_align(work_path: Path) -> list[Path]:
     )
 
     aligned_paths: list[Path] = []
-    print("\n--- Saving Aligned Masters ---")
+    print("\n--- Saving Aligned Masters ---", flush=True)
     for aligned_img, src_path in zip(aligned_masters, master_files):
         out_aligned_path = src_path.parent / f"Aligned_{src_path.name}"
         fits.writeto(
@@ -107,7 +103,7 @@ def run_align(work_path: Path) -> list[Path]:
             overwrite=True,
         )
         aligned_paths.append(out_aligned_path)
-        print(f"  * Saved: {out_aligned_path.name}")
+        print(f"  * Saved: {out_aligned_path.name}", flush=True)
 
     return aligned_paths
 
@@ -122,13 +118,15 @@ def run_fuse(
     """Stage 4: 32-bit Mertens multi-scale Laplacian pyramid fusion."""
     aligned_files = sorted(work_path.glob("bucket_*/Aligned_Master_*.fit"))
     if not aligned_files:
-        # Fallback to unaligned Master_*.fit if user skipped separate align step
         aligned_files = sorted(work_path.glob("bucket_*/Master_*.fit"))
         if not aligned_files:
             raise FileNotFoundError(
                 f"No Master FITS files found in {work_path}. Run '--step stack' and '--step align' first."
             )
 
+    print(
+        f"\n--- [Stage 4] Fusing {len(aligned_files)} Master Brackets ---", flush=True
+    )
     aligned_masters = [load_fits_to_float32(p) for p in aligned_files]
     fuse_and_export_hdr(
         aligned_masters=aligned_masters,
@@ -161,7 +159,7 @@ def main() -> None:
         "--work-dir",
         "-w",
         type=Path,
-        default=Path("./eclipse_workspace"),
+        default=Path("./workspace"),
         help="Intermediate processing workspace folder",
     )
     parser.add_argument(
@@ -170,12 +168,6 @@ def main() -> None:
         type=Path,
         default=Path("./Eclipse_HDR_Master.tif"),
         help="Output path for the 16-bit master HDR TIFF",
-    )
-    parser.add_argument(
-        "--stacking-engine",
-        choices=["python", "siril"],
-        default="python",
-        help="Intra-bucket stacking engine: 'python' or 'siril'",
     )
     parser.add_argument(
         "--sigma-low",
@@ -219,10 +211,9 @@ def main() -> None:
         if not input_path.exists():
             raise FileNotFoundError(f"Input directory does not exist: {input_path}")
 
-    # Execution dispatcher
     if args.step == "all":
         run_sort(input_path, work_path)
-        run_stack(work_path, args.stacking_engine, args.sigma_low, args.sigma_high)
+        run_stack(work_path, args.sigma_low, args.sigma_high)
         run_align(work_path)
         run_fuse(
             work_path,
@@ -236,7 +227,7 @@ def main() -> None:
         run_sort(input_path, work_path)
 
     elif args.step == "stack":
-        run_stack(work_path, args.stacking_engine, args.sigma_low, args.sigma_high)
+        run_stack(work_path, args.sigma_low, args.sigma_high)
 
     elif args.step == "align":
         run_align(work_path)
