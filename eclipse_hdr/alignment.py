@@ -1,4 +1,4 @@
-"""Solar-frame robust multi-bracket alignment with Difference of Gaussians (DoG) bandpass graph solver."""
+"""Solar-frame robust multi-bracket alignment with DoG bandpass graph solver and hot-pixel rejection."""
 
 import gc
 from pathlib import Path
@@ -33,6 +33,25 @@ def load_fits_to_float32(fits_path: Path) -> np.ndarray:
         img /= 255.0
 
     return np.clip(img, 0.0, 1.0)
+
+
+def load_fits_luminance_proxy(fits_path: Path, downsample_factor: int = 4) -> np.ndarray:
+    """Loads a lightweight binned 2D grayscale proxy of a FITS file (<2 MB RAM)."""
+    with fits.open(fits_path, memmap=True) as hdul:
+        data = hdul[0].data
+
+    if data.ndim == 3:
+        if data.shape[0] == 3:
+            lum = data[1, ::downsample_factor, ::downsample_factor].astype(np.float32)
+        else:
+            lum = data[::downsample_factor, ::downsample_factor, 1].astype(np.float32)
+    elif data.ndim == 2:
+        lum = data[::downsample_factor, ::downsample_factor].astype(np.float32)
+    else:
+        raise ValueError(f"Unsupported FITS dimension: {data.ndim}")
+
+    p_max = float(np.percentile(lum, 99.9)) or 1.0
+    return np.clip(lum / p_max, 0.0, 1.0)
 
 
 def save_preview_jpg(
@@ -83,45 +102,50 @@ def apply_spatial_shift_rgb(
     return np.clip(shifted_rgb, 0.0, 1.0)
 
 
-def extract_solar_features(img_rgb: np.ndarray) -> np.ndarray:
-    """Extracts scale-invariant high-pass solar/chromosphere features via DoG bandpass."""
-    lum = 0.299 * img_rgb[:, :, 0] + 0.587 * img_rgb[:, :, 1] + 0.114 * img_rgb[:, :, 2]
+def extract_proxy_features(lum_proxy: np.ndarray) -> np.ndarray:
+    """Computes DoG bandpass features on the proxy image, suppressing hot pixel spikes."""
+    # Light median pre-pass to remove isolated single-pixel hot defects
+    med_plane = cv2.medianBlur((lum_proxy * 65535.0).astype(np.uint16), 3) / 65535.0
+    spike = lum_proxy - med_plane
+    cleaned = np.where(spike > 0.05, med_plane, lum_proxy)
 
-    # Difference of Gaussians (DoG) isolates fixed prominences & fine coronal filaments
-    g1 = cv2.GaussianBlur(lum, (0, 0), sigmaX=1.5)
-    g2 = cv2.GaussianBlur(lum, (0, 0), sigmaX=5.0)
+    g1 = cv2.GaussianBlur(cleaned, (0, 0), sigmaX=1.0)
+    g2 = cv2.GaussianBlur(cleaned, (0, 0), sigmaX=3.5)
     dog = np.maximum(0.0, g1 - g2)
 
     p99 = float(np.percentile(dog, 99.8)) or 1.0
     norm_features = np.clip(dog / p99, 0.0, 1.0)
 
-    # 2D Hanning window to prevent Fourier border wrap-around leakage
     win_y = np.hanning(norm_features.shape[0])
     win_x = np.hanning(norm_features.shape[1])
     return (norm_features * np.outer(win_y, win_x)).astype(np.float32)
 
 
-def align_masters_graph(
-    masters: list[np.ndarray],
-    master_names: list[str],
-    anchor_idx: int = 0,
-    max_shift: float = 80.0,
+def solve_alignment_shifts_graph(
+    master_files: list[Path],
+    downsample: int = 4,
     upsample_factor: int = 100,
-) -> list[np.ndarray]:
-    """Pure 2D translation alignment using feature graph correlation and Minimum Spanning Tree."""
-    n = len(masters)
-    if n <= 1:
-        return masters
+    max_shift_fullres: float = 80.0,
+) -> tuple[int, list[tuple[float, float]]]:
+    """Solves the Minimum Spanning Tree alignment offsets using low-memory proxies (<50MB RAM)."""
+    n = len(master_files)
+    print(f"\n--- [Stage 3] Low-Memory Proxy Registration ({n} Masters) ---", flush=True)
 
-    print(
-        f"\n--- Solving Feature Correlation Graph ({n} Masters) [Anchor: {master_names[anchor_idx]}] ---",
-        flush=True,
-    )
+    # 1. Load lightweight proxies
+    proxies = [load_fits_luminance_proxy(p, downsample_factor=downsample) for p in master_files]
+    features = [extract_proxy_features(p) for p in proxies]
 
-    # Compute high-pass feature maps (binned 2x for correlation speed)
-    features = [extract_solar_features(m)[::2, ::2] for m in masters]
+    # Select anchor frame with highest mean coronal/prominence signal
+    anchor_idx = int(np.argmax([float(np.mean(p)) for p in proxies]))
+    del proxies
+    gc.collect()
+
+    print(f"  * Selected Solar Anchor: {master_files[anchor_idx].stem}", flush=True)
+
+    # 2. Pairwise cross-correlation
     cost_matrix = np.full((n, n), np.inf)
     shift_matrix = np.zeros((n, n, 2), dtype=np.float64)
+    max_proxy_shift = max_shift_fullres / float(downsample)
 
     for i in range(n):
         for j in range(i + 1, n):
@@ -130,15 +154,22 @@ def align_masters_graph(
                 features[j],
                 upsample_factor=upsample_factor,
             )
-            dy, dx = float(shift[0] * 2.0), float(shift[1] * 2.0)
-            dist = float(np.hypot(dy, dx))
+            dy_proxy, dx_proxy = float(shift[0]), float(shift[1])
+            dist_proxy = float(np.hypot(dy_proxy, dx_proxy))
 
-            if dist <= max_shift:
+            if dist_proxy <= max_proxy_shift:
+                dy_full = dy_proxy * float(downsample)
+                dx_full = dx_proxy * float(downsample)
+
                 cost_matrix[i, j] = error
                 cost_matrix[j, i] = error
-                shift_matrix[i, j] = [dy, dx]
-                shift_matrix[j, i] = [-dy, -dx]
+                shift_matrix[i, j] = [dy_full, dx_full]
+                shift_matrix[j, i] = [-dy_full, -dx_full]
 
+    del features
+    gc.collect()
+
+    # 3. Minimum Spanning Tree
     adj_matrix = np.where(np.isinf(cost_matrix), 1e6, cost_matrix)
     mst = minimum_spanning_tree(adj_matrix).toarray()
 
@@ -149,6 +180,7 @@ def align_masters_graph(
                 graph[i].append((j, tuple(shift_matrix[i, j])))
                 graph[j].append((i, tuple(shift_matrix[j, i])))
 
+    # 4. BFS graph traversal to calculate cumulative shifts
     final_shifts = np.zeros((n, 2), dtype=np.float64)
     visited = {anchor_idx}
     queue = [anchor_idx]
@@ -161,46 +193,46 @@ def align_masters_graph(
                 final_shifts[neighbor] = final_shifts[curr] + np.array([dy, dx])
                 queue.append(neighbor)
 
-    aligned_masters = []
-    for i, (img, name) in enumerate(zip(masters, master_names)):
-        dy, dx = float(final_shifts[i, 0]), float(final_shifts[i, 1])
-        print(
-            f"  * {name:22s} -> Offset vs Solar Anchor: (dy={dy:+.2f}px, dx={dx:+.2f}px, dist={np.hypot(dy, dx):.2f}px)",
-            flush=True,
-        )
-        shifted = apply_spatial_shift_rgb(img, dy, dx)
-        aligned_masters.append(shifted)
-
-    return aligned_masters
+    shift_tuples = [(float(final_shifts[i, 0]), float(final_shifts[i, 1])) for i in range(n)]
+    return anchor_idx, shift_tuples
 
 
 def winsorized_sigma_clip_stack(
     stack_array: np.ndarray,
     sigma_low: float = 3.0,
-    sigma_high: float = 3.0,
+    sigma_high: float = 2.2,
 ) -> np.ndarray:
-    """Fast vectorized sigma-clipping stack for pre-allocated arrays in memory."""
-    n_frames = stack_array.shape[0]
-    if n_frames == 1:
-        return stack_array[0]
-    if n_frames == 2:
-        return np.mean(stack_array, axis=0, dtype=np.float32)
+    """Vectorized sigma-clipping stack with single-pixel defect suppression."""
+    n_frames, h, w, c = stack_array.shape
 
-    mean = np.mean(stack_array, axis=0, dtype=np.float32)
-    std = np.std(stack_array, axis=0, dtype=np.float32)
-    std = np.where(std == 0, 1e-6, std)
+    if n_frames >= 3:
+        median = np.median(stack_array, axis=0)
+        mad = np.median(np.abs(stack_array - median), axis=0)
+        std_est = 1.4826 * np.where(mad == 0, 1e-5, mad)
 
-    lower_bound = mean - (sigma_low * std)
-    upper_bound = mean + (sigma_high * std)
+        lower_bound = median - (sigma_low * std_est)
+        upper_bound = median + (sigma_high * std_est)
 
-    winsorized = np.clip(stack_array, lower_bound, upper_bound)
-    return np.mean(winsorized, axis=0, dtype=np.float32)
+        winsorized = np.clip(stack_array, lower_bound, upper_bound)
+        master = np.mean(winsorized, axis=0, dtype=np.float32)
+    else:
+        master = np.mean(stack_array, axis=0, dtype=np.float32)
+
+    # Spatial Hot-Pixel Cleaner to suppress surviving stationary defects
+    cleaned_master = np.zeros_like(master)
+    for ch in range(c):
+        plane = master[:, :, ch]
+        med_plane = cv2.medianBlur((plane * 65535.0).astype(np.uint16), 3) / 65535.0
+        spike = plane - med_plane
+        cleaned_master[:, :, ch] = np.where(spike > 0.05, med_plane, plane)
+
+    return np.clip(cleaned_master, 0.0, 1.0)
 
 
 def align_and_stack_bucket_dft(
     fits_paths: list[Path],
     sigma_low: float = 3.0,
-    sigma_high: float = 3.0,
+    sigma_high: float = 2.2,
     upsample_factor: int = 100,
     max_allowed_shift: float = 50.0,
 ) -> np.ndarray:
@@ -209,7 +241,15 @@ def align_and_stack_bucket_dft(
     if num_frames == 0:
         raise ValueError("No FITS paths provided.")
     if num_frames == 1:
-        return load_fits_to_float32(fits_paths[0])
+        img = load_fits_to_float32(fits_paths[0])
+        # Clean hot pixels even on single-frame buckets
+        cleaned_single = np.zeros_like(img)
+        for ch in range(3):
+            plane = img[:, :, ch]
+            med_plane = cv2.medianBlur((plane * 65535.0).astype(np.uint16), 3) / 65535.0
+            spike = plane - med_plane
+            cleaned_single[:, :, ch] = np.where(spike > 0.05, med_plane, plane)
+        return cleaned_single
 
     ref_img = load_fits_to_float32(fits_paths[0])
 
