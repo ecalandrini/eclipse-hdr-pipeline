@@ -1,4 +1,4 @@
-"""Artifact-free multi-scale coronal enhancement using logarithmic bandpass filtering."""
+"""Artifact-free astronomical coronal detail enhancement via log-space bandpass filtering."""
 
 from pathlib import Path
 from astropy.io import fits
@@ -8,116 +8,129 @@ from PIL import Image
 import tifffile
 
 
-def detect_solar_center(img_rgb: np.ndarray) -> tuple[float, float, float]:
-    """Estimates the solar center (cx, cy) and approximate lunar radius in pixel coordinates."""
-    lum = 0.299 * img_rgb[:, :, 0] + 0.587 * img_rgb[:, :, 1] + 0.114 * img_rgb[:, :, 2]
-    h, w = lum.shape
+def load_any_master(input_path: Path) -> np.ndarray:
+    """Robustly loads FITS, TIFF, or JPG masters into normalized [0.0, 1.0] float32 RGB."""
+    ext = input_path.suffix.lower()
 
-    blur = cv2.GaussianBlur((np.clip(lum, 0.0, 1.0) * 255.0).astype(np.uint8), (9, 9), 0)
-    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if ext in (".fit", ".fits"):
+        with fits.open(input_path, memmap=False) as hdul:
+            data = hdul[0].data.astype(np.float32)
+        if data.ndim == 3:
+            if data.shape[0] == 3:
+                img = np.transpose(data, (1, 2, 0))
+            else:
+                img = data
+        elif data.ndim == 2:
+            img = np.repeat(data[:, :, np.newaxis], 3, axis=2)
+        else:
+            raise ValueError(f"Unsupported FITS shape: {data.shape}")
 
-    contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        c = max(contours, key=cv2.contourArea)
-        (cx, cy), radius = cv2.minEnclosingCircle(c)
-        if 0.1 * min(h, w) < radius < 0.45 * min(h, w):
-            return float(cx), float(cy), float(radius)
+    else:
+        raw = tifffile.imread(str(input_path))
+        if raw.ndim == 2:
+            raw = np.repeat(raw[:, :, np.newaxis], 3, axis=2)
+        elif raw.ndim == 3 and raw.shape[2] > 3:
+            raw = raw[:, :, :3]
 
-    return float(w / 2.0), float(h / 2.0), min(h, w) * 0.22
+        if raw.dtype == np.uint8:
+            img = raw.astype(np.float32) / 255.0
+        elif raw.dtype == np.uint16:
+            img = raw.astype(np.float32) / 65535.0
+        else:
+            img = raw.astype(np.float32)
+
+    # Clean extreme outliers & normalize non-zero peak to 1.0
+    p_high = float(np.percentile(img, 99.99)) or 1.0
+    img = np.clip(img / p_high, 0.0, 1.0)
+    return img
 
 
-def multiscale_coronal_enhancement(
+def enhance_coronal_structures(
     img_rgb: np.ndarray,
-    center: tuple[float, float],
-    r_lunar: float,
-    compression_gamma: float = 0.5,
-    fine_detail_boost: float = 1.4,
-    medium_detail_boost: float = 1.2,
+    asinh_stretch: float = 10.0,
+    fine_sharpen: float = 1.2,
+    streamer_boost: float = 1.5,
 ) -> np.ndarray:
-    """Enhances fine magnetic streamers and loops across the whole field without circular artifacts."""
+    """Enhances fine magnetic loops and outer coronal streamers without geometric masks."""
     h, w, c = img_rgb.shape
-    cx, cy = center
 
-    # 1. Lunar silhouette protection mask
-    y_idx, x_idx = np.ogrid[:h, :w]
-    dist_from_moon = np.hypot(x_idx - cx, y_idx - cy).astype(np.float32)
-    moon_mask = np.clip((dist_from_moon - (r_lunar * 0.98)) / (0.04 * r_lunar), 0.0, 1.0)
-    moon_mask = np.repeat(moon_mask[:, :, np.newaxis], c, axis=2)
+    # 1. Estimate background level from corners
+    border_px = np.concatenate([
+        img_rgb[:20, :, :].reshape(-1, c),
+        img_rgb[-20:, :, :].reshape(-1, c),
+        img_rgb[:, :20, :].reshape(-1, c),
+        img_rgb[:, -20:, :].reshape(-1, c),
+    ], axis=0)
+    bg_pedestal = np.median(border_px, axis=0)
 
-    # 2. Smooth non-linear dynamic range compression
-    base_compressed = np.power(np.clip(img_rgb, 0.0, 1.0), compression_gamma)
+    # 2. Subtract background & apply Asinh tone mapping for compression
+    flux = np.maximum(0.0, img_rgb - bg_pedestal)
+    p99 = np.percentile(flux, 99.9, axis=(0, 1)) + 1e-6
+    norm_flux = np.clip(flux / p99, 0.0, 1.0)
 
-    # 3. Multi-Scale Frequency Decomposition
-    blur_fine = cv2.GaussianBlur(base_compressed, (0, 0), sigmaX=2.0)
-    high_freq = base_compressed - blur_fine
+    # Log/Asinh domain: maps faint outer streamers to equal footing with inner corona
+    log_base = np.arcsinh(norm_flux * asinh_stretch) / np.arcsinh(asinh_stretch)
 
-    blur_med = cv2.GaussianBlur(base_compressed, (0, 0), sigmaX=8.0)
-    blur_coarse = cv2.GaussianBlur(base_compressed, (0, 0), sigmaX=32.0)
-    med_freq = blur_med - blur_coarse
+    # 3. Multi-Scale Frequency Decomposition (Spatial Bandpass)
+    # Fine details: prominences, chromosphere spikes (sigma = 1.5 px)
+    fine_blur = cv2.GaussianBlur(log_base, (0, 0), sigmaX=1.5)
+    fine_detail = log_base - fine_blur
 
-    # 4. Detail injection
+    # Medium details: coronal magnetic filaments (sigma = 6.0 vs sigma = 24.0 px)
+    med_blur_small = cv2.GaussianBlur(log_base, (0, 0), sigmaX=6.0)
+    med_blur_large = cv2.GaussianBlur(log_base, (0, 0), sigmaX=24.0)
+    streamer_detail = med_blur_small - med_blur_large
+
+    # 4. Synthesize Enhanced Master
+    # Blend high frequencies back into compressed base
     enhanced = (
-        base_compressed
-        + (fine_detail_boost * high_freq * moon_mask)
-        + (medium_detail_boost * med_freq * moon_mask)
+        log_base
+        + (fine_sharpen * fine_detail)
+        + (streamer_boost * streamer_detail)
     )
+    enhanced = np.clip(enhanced, 0.0, 1.0)
 
-    enhanced = enhanced * moon_mask
+    # 5. Black-level calibration: ensure sky background stays neutral dark
+    dark_cut = float(np.percentile(enhanced, 1.0))
+    calibrated = np.clip((enhanced - dark_cut) / (1.0 - dark_cut), 0.0, 1.0)
 
-    # 5. Global normalisation
-    p99 = float(np.percentile(enhanced[enhanced > 0], 99.9)) or 1.0
-    return np.clip(enhanced / p99, 0.0, 1.0)
+    return calibrated.astype(np.float32)
 
 
 def process_coronal_features(
     input_master_path: Path,
     output_dir: Path,
-    sharpen_amount: float = 1.4,
+    sharpen_amount: float = 1.2,
 ) -> None:
-    """Post-processing pipeline for total eclipse HDR composites."""
+    """Full post-processing workflow for HDR eclipse composites."""
     print("\n" + "=" * 65, flush=True)
-    print("       POST-PROCESSING: MULTI-SCALE CORONAL DETAIL EXTRACTION     ", flush=True)
+    print("       POST-PROCESSING: LOG-SPACE CORONAL FILAMENT EXTRACTION     ", flush=True)
     print("=" * 65, flush=True)
     print(f"  * Input File            : {input_master_path.resolve()}", flush=True)
-
-    if input_master_path.suffix.lower() in (".fit", ".fits"):
-        with fits.open(input_master_path) as h:
-            data = h[0].data.astype(np.float32)
-        if data.ndim == 3:
-            img = np.transpose(data, (1, 2, 0)) if data.shape[0] == 3 else data
-        elif data.ndim == 2:
-            img = np.repeat(data[:, :, np.newaxis], 3, axis=2)
-        else:
-            raise ValueError(f"Unsupported FITS shape: {data.shape}")
-        p99 = float(np.percentile(img[img > 0], 99.9)) or 1.0
-        img = np.clip(img / p99, 0.0, 1.0)
-    else:
-        img_raw = tifffile.imread(str(input_master_path)).astype(np.float32)
-        if img_raw.ndim == 2:
-            img_raw = np.repeat(img_raw[:, :, np.newaxis], 3, axis=2)
-        img = img_raw / 65535.0 if img_raw.max() > 255.0 else img_raw / 255.0
-
-    cx, cy, r_lunar = detect_solar_center(img)
-    print(f"  * Detected Lunar Center : ({cx:.2f}, {cy:.2f})", flush=True)
-    print(f"  * Lunar Limb Radius     : {r_lunar:.2f} px", flush=True)
     print(f"  * Sharpening Multiplier : {sharpen_amount:.2f}", flush=True)
     print("-" * 65, flush=True)
 
-    enhanced = multiscale_coronal_enhancement(
+    img = load_any_master(input_master_path)
+
+    enhanced = enhance_coronal_structures(
         img_rgb=img,
-        center=(cx, cy),
-        r_lunar=r_lunar,
-        compression_gamma=0.5,
-        fine_detail_boost=sharpen_amount,
-        medium_detail_boost=sharpen_amount * 0.85,
+        asinh_stretch=12.0,
+        fine_sharpen=sharpen_amount,
+        streamer_boost=sharpen_amount * 1.2,
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # 1. 16-Bit TIFF
     out_tiff = output_dir / f"{input_master_path.stem}_Enhanced.tif"
-    tifffile.imwrite(str(out_tiff), (enhanced * 65535.0).astype(np.uint16), photometric="rgb")
+    tifffile.imwrite(
+        str(out_tiff),
+        (enhanced * 65535.0).astype(np.uint16),
+        photometric="rgb",
+    )
     print(f"  [Exported 16-bit Enhanced TIFF] -> {out_tiff.resolve()}", flush=True)
 
+    # 2. Preview JPG
     out_jpg = output_dir / f"{input_master_path.stem}_Enhanced.jpg"
     preview_8u = (enhanced * 255.0).astype(np.uint8)
     Image.fromarray(preview_8u, mode="RGB").save(out_jpg, quality=95)
