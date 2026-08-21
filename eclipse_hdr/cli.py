@@ -5,9 +5,9 @@ from pathlib import Path
 from astropy.io import fits
 import numpy as np
 
-from .alignment import (
+from eclipse_hdr.alignment import (
     align_and_stack_bucket_dft,
-    align_masters_taubin,
+    align_masters_graph,
     load_fits_to_float32,
     save_preview_jpg,
 )
