@@ -288,6 +288,13 @@ def main() -> None:
         default=1.8,
         help="Unsharp mask sharpening strength for coronal loops (default: 1.8)",
     ) 
+    parser.add_argument(
+        "--input-file",
+        "-f",
+        type=Path,
+        default=None,
+        help="Explicit input file to process for '--step postprocess' (e.g. ./Eclipse_HDR_Master_Artistic_HDR.tif)",
+    ) 
     
     args = parser.parse_args()
     work_path = args.work_dir.resolve()
@@ -342,13 +349,30 @@ def main() -> None:
             args.sat_weight,
             args.exp_weight,
         )
-    
     elif args.step == "postprocess":
-        target_master = output_path.with_name(f"{output_path.stem}_Artistic_HDR.tif")
-        if not target_master.exists():
-            target_master = output_path
+        # Resolve target input file
+        if args.input_file:
+            target_input = args.input_file.resolve()
+        elif args.input_dir and args.input_dir.is_file():
+            target_input = args.input_dir.resolve()
+        else:
+            # Automatic fallback resolution
+            candidates = [
+                output_path.with_name(f"{output_path.stem}_Artistic_HDR.tif"),
+                output_path.with_name(f"{output_path.stem}_Scientific_Linear.fits"),
+                output_path.with_name(f"{output_path.stem}_Scientific_Linear.tif"),
+                output_path,
+            ]
+            target_input = next((p for p in candidates if p.exists()), None)
+
+        if not target_input or not target_input.exists():
+            parser.error(
+                f"Could not find an input master file for post-processing. "
+                f"Please specify an existing file using '--input-file <path>' or '-f <path>'."
+            )
+
         process_coronal_features(
-            input_master_path=target_master,
+            input_master_path=target_input,
             output_dir=work_path,
             sharpen_amount=args.sharpen,
         )
