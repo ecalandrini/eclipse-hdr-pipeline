@@ -1,4 +1,4 @@
-"""Multi-scale Laplacian pyramid HDR exposure fusion with lunar disk cleaning."""
+"""Multi-scale Laplacian pyramid HDR exposure fusion (Mertens et al.)."""
 
 from pathlib import Path
 import cv2
@@ -13,7 +13,6 @@ def fuse_and_export_hdr(
     contrast_w: float = 1.0,
     sat_w: float = 1.2,
     exp_w: float = 0.5,
-    lunar_mask_margin_px: float = 5.0,
 ) -> None:
     """Fuses linear bracketed astronomical masters into a 16-bit TIFF and an auto-stretched preview JPG."""
     num_masters = len(aligned_masters)
@@ -47,22 +46,11 @@ def fuse_and_export_hdr(
     fusion_rgb = np.nan_to_num(fusion_rgb, nan=0.0, posinf=1.0, neginf=0.0)
     fusion_rgb = np.clip(fusion_rgb, 0.0, 1.0)
 
-    # 2. Lunar Disk Masking: eliminate the internal drifting moon ghost
-    h, w, _ = fusion_rgb.shape
-    cx, cy = w / 2.0, h / 2.0
-    r_est = min(h, w) * 0.22 - lunar_mask_margin_px
-
-    y_g, x_g = np.ogrid[:h, :w]
-    r_dist = np.hypot(x_g - cx, y_g - cy)
-    # Smooth 3-pixel cosine/linear roll-off
-    lunar_mask = np.clip((r_dist - (r_est - 2.0)) / 3.0, 0.0, 1.0)[:, :, np.newaxis]
-    fusion_rgb *= lunar_mask
-
     # Normalize highlight dynamic range
     f_max = float(np.percentile(fusion_rgb, 99.99)) or 1.0
     fusion_rgb = np.clip(fusion_rgb / f_max, 0.0, 1.0)
 
-    # 3. Export 16-bit Master TIFF
+    # 2. Export 16-bit Master TIFF
     fusion_16u = (fusion_rgb * 65535.0).astype(np.uint16)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -74,7 +62,7 @@ def fuse_and_export_hdr(
     )
     print(f"  [Saved 16-bit TIFF] -> {output_path.resolve()}", flush=True)
 
-    # 4. Export preview JPG
+    # 3. Export preview JPG
     preview_jpg = output_path.with_suffix(".jpg")
     m = 0.08
     stretched = np.where(
