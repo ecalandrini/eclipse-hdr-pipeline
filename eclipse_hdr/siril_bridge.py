@@ -16,17 +16,16 @@ def demosaic_bucket_with_siril(bucket_dir: Path) -> list[Path]:
         app.Open()
         cmd = Wrapper(app)
 
-        # Pass pure string path without single-quote encapsulation
+        # Change working directory inside Siril
         cmd.cd(str(b_path))
 
-        # Convert RAW sequence to 32-bit linear demosaiced FITS (conv_*.fit)
-        # 'convertraw' handles camera RAW formats (.RAF, .CR2, .NEF, etc.)
-        cmd.cmd("convertraw light -debayer -out=conv")
+        # Convert raw sequence to 32-bit demosaiced FITS sequence (conv_00001.fit, etc.)
+        cmd.Send("convertraw light -debayer -out=conv")
 
         fits_files = sorted(b_path.glob("conv_*.fit"))
         if not fits_files:
-            # Fallback if Siril version uses standard convert for raws in current dir
-            cmd.cmd("convert light -debayer -out=conv")
+            # Fallback if the Siril build uses standard convert for raws in the active directory
+            cmd.Send("convert light -debayer -out=conv")
             fits_files = sorted(b_path.glob("conv_*.fit"))
 
         if not fits_files:
@@ -60,23 +59,23 @@ def register_and_stack_with_siril(
         cmd.cd(str(b_path))
 
         # 1. Demosaic RAW files to 32-bit linear FITS sequence
-        cmd.cmd("convertraw light -debayer -out=conv")
+        cmd.Send("convertraw light -debayer -out=conv")
         fits_files = sorted(b_path.glob("conv_*.fit"))
         if not fits_files:
-            cmd.cmd("convert light -debayer -out=conv")
+            cmd.Send("convert light -debayer -out=conv")
 
         # If only 1 frame exists in the bucket, load and save as master
         if len(raw_files) == 1:
-            cmd.cmd("load conv_00001.fit")
-            cmd.cmd(f"save {output_master_name}")
+            cmd.Send("load conv_00001.fit")
+            cmd.Send(f"save {output_master_name}")
             return b_path / f"{output_master_name}.fit"
 
         # 2. Register sequence using 2-pass translation (shift-only)
-        cmd.cmd("register conv -2pass -transf=shift")
-        cmd.cmd("seqapplyreg conv -framing=current")
+        cmd.Send("register conv -2pass -transf=shift")
+        cmd.Send("seqapplyreg conv -framing=current")
 
         # 3. Stack with Winsorized Sigma Clipping and additive normalization
-        cmd.cmd(
+        cmd.Send(
             f"stack r_conv rej {sigma_low} {sigma_high} -norm=add -out={output_master_name}"
         )
 
