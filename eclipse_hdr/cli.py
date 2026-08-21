@@ -350,13 +350,11 @@ def main() -> None:
             args.exp_weight,
         )
     elif args.step == "postprocess":
-        # Resolve target input file
         if args.input_file:
             target_input = args.input_file.resolve()
         elif args.input_dir and args.input_dir.is_file():
             target_input = args.input_dir.resolve()
         else:
-            # Automatic fallback resolution
             candidates = [
                 output_path.with_name(f"{output_path.stem}_Artistic_HDR.tif"),
                 output_path.with_name(f"{output_path.stem}_Scientific_Linear.fits"),
@@ -366,17 +364,13 @@ def main() -> None:
             target_input = next((p for p in candidates if p.exists()), None)
 
         if not target_input or not target_input.exists():
-            parser.error(
-                f"Could not find an input master file for post-processing. "
-                f"Please specify an existing file using '--input-file <path>' or '-f <path>'."
-            )
+            parser.error("Could not find input file. Specify '--input-file <path>'.")
 
         process_coronal_features(
             input_master_path=target_input,
             output_dir=work_path,
             sharpen_amount=args.sharpen,
         )
-
 
 if __name__ == "__main__":
     main()

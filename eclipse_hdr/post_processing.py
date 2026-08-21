@@ -1,4 +1,4 @@
-"""Artifact-free astronomical coronal detail enhancement via local contrast bandpass."""
+"""Miloslav Druckmüller-style Adaptive Contrast Enhancement (ACF) in Polar Space."""
 
 from pathlib import Path
 from astropy.io import fits
@@ -9,7 +9,7 @@ import tifffile
 
 
 def load_master_for_enhancement(input_path: Path) -> tuple[np.ndarray, bool]:
-    """Loads master and detects if it is linear (FITS/linear TIFF) or already tone-mapped."""
+    """Loads master array and detects dynamic range format."""
     ext = input_path.suffix.lower()
     is_linear = False
 
@@ -24,10 +24,9 @@ def load_master_for_enhancement(input_path: Path) -> tuple[np.ndarray, bool]:
         else:
             raise ValueError(f"Unsupported FITS shape: {data.shape}")
 
-        # Linear flux normalization
+        # Protect positive values
         p99 = float(np.percentile(img[img > 0], 99.95)) if np.any(img > 0) else 1.0
         img = np.clip(img / max(p99, 1e-6), 0.0, 1.0)
-
     else:
         raw = tifffile.imread(str(input_path))
         if raw.ndim == 2:
@@ -50,81 +49,150 @@ def load_master_for_enhancement(input_path: Path) -> tuple[np.ndarray, bool]:
     return img, is_linear
 
 
-def enhance_coronal_structures(
+def detect_solar_center_accurate(img_rgb: np.ndarray) -> tuple[float, float, float]:
+    """Detects solar center (cx, cy) and lunar radius in pixel coordinates."""
+    lum = 0.299 * img_rgb[:, :, 0] + 0.587 * img_rgb[:, :, 1] + 0.114 * img_rgb[:, :, 2]
+    h, w = lum.shape
+
+    grad_x = cv2.Sobel(lum, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(lum, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = cv2.magnitude(grad_x, grad_y)
+
+    p99 = float(np.percentile(grad_mag, 99.5)) or 1.0
+    edges = (grad_mag > p99 * 0.4).astype(np.uint8) * 255
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        c = max(contours, key=cv2.contourArea)
+        (cx, cy), radius = cv2.minEnclosingCircle(c)
+        if 0.1 * min(h, w) < radius < 0.45 * min(h, w):
+            return float(cx), float(cy), float(radius)
+
+    return float(w / 2.0), float(h / 2.0), min(h, w) * 0.22
+
+
+def apply_druckmuller_acf(
     img_rgb: np.ndarray,
-    is_linear: bool = False,
-    fine_sharpen: float = 0.8,
-    streamer_boost: float = 1.0,
+    center: tuple[float, float],
+    r_lunar: float,
+    boost: float = 1.8,
 ) -> np.ndarray:
-    """Enhances fine magnetic loops and coronal streamers without blowing out the core."""
+    """Adaptive Contrast Enhancement (ACF) in polar coordinates.
+    
+    Transforms the frame to polar (r, theta), computes azimuthal moving-window
+    mean and standard deviation, standardizes each radial ring to isolate
+    tangential magnetic structures, and maps back to Cartesian coordinates.
+    """
     h, w, c = img_rgb.shape
+    cx, cy = center
+    max_r = int(min(cx, cy, w - cx, h - cy) * 0.98)
+    n_theta = 1440  # High angular resolution
 
-    # 1. Tone curve: Only apply asinh if input is strictly linear
-    if is_linear:
-        border_px = np.concatenate([
-            img_rgb[:20, :, :].reshape(-1, c),
-            img_rgb[-20:, :, :].reshape(-1, c),
-            img_rgb[:, :20, :].reshape(-1, c),
-            img_rgb[:, -20:, :].reshape(-1, c),
-        ], axis=0)
-        bg = np.median(border_px, axis=0)
-        flux = np.maximum(0.0, img_rgb - bg)
-        base = np.arcsinh(flux * 20.0) / np.arcsinh(20.0)
-    else:
-        # Artistic Mertens TIFF is ALREADY tone-mapped; do NOT re-stretch
-        base = img_rgb.copy()
-
-    # 2. Multi-Scale Frequency Decomposition (Spatial Bandpass)
-    # Fine details: prominences, chromosphere (sigma = 1.5 px)
-    fine_blur = cv2.GaussianBlur(base, (0, 0), sigmaX=1.5)
-    fine_detail = base - fine_blur
-
-    # Medium details: coronal streamers and magnetic arches (sigma = 6 vs sigma = 24 px)
-    med_blur_small = cv2.GaussianBlur(base, (0, 0), sigmaX=6.0)
-    med_blur_large = cv2.GaussianBlur(base, (0, 0), sigmaX=24.0)
-    streamer_detail = med_blur_small - med_blur_large
-
-    # 3. High-Pass Detail Recombination (Add without global pedestal shift)
-    enhanced = base + (fine_sharpen * fine_detail) + (streamer_boost * streamer_detail)
-
-    # 4. Safe Highlight Preservation (Prevents clipping saturated cores to 1.0)
-    # Soft knee compression on upper 10% of dynamic range
-    enhanced = np.where(
-        enhanced > 0.90,
-        0.90 + 0.10 * np.tanh((enhanced - 0.90) / 0.10),
-        enhanced,
+    # 1. Non-linear log pre-stretch so noise floor doesn't dominate outer bands
+    log_img = np.log10(np.maximum(img_rgb, 1e-5))
+    
+    # 2. Warp to Polar Coordinates (r, theta)
+    polar_img = cv2.warpPolar(
+        log_img,
+        (max_r, n_theta),
+        (cx, cy),
+        max_r,
+        cv2.WARP_POLAR_LINEAR + cv2.WARP_FILL_OUTLIERS,
     )
 
-    return np.clip(enhanced, 0.0, 1.0).astype(np.float32)
+    # 3. For each color channel, compute moving angular baseline and deviation
+    polar_enhanced = np.zeros_like(polar_img)
+
+    for ch in range(c):
+        plane = polar_img[:, :, ch]
+
+        # Low-pass filter along theta (angular direction) using large kernel
+        # Wrap borders along theta for 360-degree continuity
+        plane_padded = np.vstack([plane[-90:, :], plane, plane[:90, :]])
+        mu = cv2.GaussianBlur(plane_padded, (1, 101), sigmaX=0, sigmaY=25.0)[90:-90, :]
+
+        # High-pass angular residual
+        diff = plane - mu
+
+        # Standard deviation along theta
+        diff_sq = cv2.GaussianBlur(
+            np.vstack([diff[-90:, :] ** 2, diff ** 2, diff[:90, :] ** 2]),
+            (1, 101),
+            sigmaX=0,
+            sigmaY=25.0,
+        )[90:-90, :]
+        sigma = np.sqrt(np.maximum(diff_sq, 1e-4))
+
+        # Normalized adaptive contrast (Druckmüller quotient)
+        norm_plane = diff / (sigma + 0.05)
+
+        # Re-scale back to displayable dynamic range
+        polar_enhanced[:, :, ch] = norm_plane
+
+    # 4. Warp back to Cartesian coordinates
+    enhanced_cartesian = cv2.warpPolar(
+        polar_enhanced,
+        (w, h),
+        (cx, cy),
+        max_r,
+        cv2.WARP_POLAR_LINEAR + cv2.WARP_INVERSE_MAP,
+    )
+
+    # 5. Lunar limb protection & blending with original frame
+    y_idx, x_idx = np.ogrid[:h, :w]
+    dist_r = np.hypot(x_idx - cx, y_idx - cy).astype(np.float32)
+
+    # Mask: 0 inside Moon, 1 in corona, smoothly tapers to 0 at extreme frame edge
+    coronal_mask = np.clip((dist_r - r_lunar) / (0.04 * r_lunar), 0.0, 1.0)
+    outer_mask = np.clip((max_r - dist_r) / (0.15 * max_r), 0.0, 1.0)
+    blend_mask = (coronal_mask * outer_mask)[:, :, np.newaxis]
+
+    # Combine normalized high-pass details with compressed base
+    base_curved = np.arcsinh(img_rgb * 30.0) / np.arcsinh(30.0)
+    
+    # Scale enhanced details to visible range
+    p99_enh = float(np.percentile(np.abs(enhanced_cartesian), 99.5)) or 1.0
+    norm_details = np.clip(enhanced_cartesian / (p99_enh * 1.5), -1.0, 1.0)
+
+    final_rgb = base_curved + (boost * norm_details * blend_mask * 0.4)
+    final_rgb = final_rgb * coronal_mask[:, :, np.newaxis]
+
+    p99_final = float(np.percentile(final_rgb[final_rgb > 0], 99.9)) or 1.0
+    return np.clip(final_rgb / p99_final, 0.0, 1.0).astype(np.float32)
 
 
 def process_coronal_features(
     input_master_path: Path,
     output_dir: Path,
-    sharpen_amount: float = 0.8,
+    algorithm: str = "druckmuller",
+    sharpen_amount: float = 1.8,
 ) -> None:
-    """Post-processing pipeline for HDR eclipse composites."""
+    """Full coronal feature enhancement pipeline."""
     print("\n" + "=" * 65, flush=True)
-    print("       POST-PROCESSING: LOG-SPACE CORONAL FILAMENT EXTRACTION     ", flush=True)
+    print("       CORONAL FEATURE ENHANCEMENT (DRUCKMÜLLER ACF)              ", flush=True)
     print("=" * 65, flush=True)
     print(f"  * Input File            : {input_master_path.resolve()}", flush=True)
-    print(f"  * Sharpening Multiplier : {sharpen_amount:.2f}", flush=True)
+    print(f"  * Algorithm             : DRUCKMÜLLER POLAR ACF", flush=True)
+    print(f"  * Boost Intensity       : {sharpen_amount:.2f}", flush=True)
 
     img, is_linear = load_master_for_enhancement(input_master_path)
-    print(f"  * Detected Data Mode    : {'Strict Linear' if is_linear else 'Tone-Mapped (Mertens)'}", flush=True)
+    cx, cy, r_lunar = detect_solar_center_accurate(img)
+    print(f"  * Solar Centroid        : ({cx:.2f}, {cy:.2f})", flush=True)
+    print(f"  * Lunar Radius          : {r_lunar:.2f} px", flush=True)
     print("-" * 65, flush=True)
 
-    enhanced = enhance_coronal_structures(
+    print("  * Computing Polar Adaptive Contrast Normalization...", flush=True)
+    enhanced = apply_druckmuller_acf(
         img_rgb=img,
-        is_linear=is_linear,
-        fine_sharpen=sharpen_amount,
-        streamer_boost=sharpen_amount * 1.1,
+        center=(cx, cy),
+        r_lunar=r_lunar,
+        boost=sharpen_amount,
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Export 16-Bit Master TIFF
-    out_tiff = output_dir / f"{input_master_path.stem}_Enhanced.tif"
+    # 16-Bit Master TIFF
+    out_tiff = output_dir / f"{input_master_path.stem}_Druckmuller_Enhanced.tif"
     tifffile.imwrite(
         str(out_tiff),
         (enhanced * 65535.0).astype(np.uint16),
@@ -132,8 +200,8 @@ def process_coronal_features(
     )
     print(f"  [Exported 16-bit Enhanced TIFF] -> {out_tiff.resolve()}", flush=True)
 
-    # Export Preview JPG
-    out_jpg = output_dir / f"{input_master_path.stem}_Enhanced.jpg"
+    # Preview JPG
+    out_jpg = output_dir / f"{input_master_path.stem}_Druckmuller_Enhanced.jpg"
     preview_8u = (enhanced * 255.0).astype(np.uint8)
     Image.fromarray(preview_8u, mode="RGB").save(out_jpg, quality=95)
     print(f"  [Exported Enhanced JPG Preview] -> {out_jpg.resolve()}", flush=True)
