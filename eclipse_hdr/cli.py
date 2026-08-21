@@ -207,9 +207,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--step",
-        choices=["all", "sort", "stack", "align", "fuse"],
+        type=str,
+        choices=["all", "sort", "stack", "align", "fuse", "postprocess"],
         default="all",
-        help="Pipeline step to run: 'sort', 'stack', 'align', 'fuse', or 'all' (default: all)",
+        help="Execution step: 'sort', 'stack', 'align', 'fuse', 'postprocess', or 'all'",
     )
     parser.add_argument(
         "--input-dir",
@@ -280,13 +281,6 @@ def main() -> None:
         choices=["scientific", "artistic", "both"],
         default="both",
         help="HDR fusion mode: 'scientific' (linear radiance), 'artistic' (Mertens pyramid), or 'both' (default: both)",
-    )
-    parser.add_argument(
-        "--step",
-        type=str,
-        choices=["all", "sort", "stack", "align", "fuse", "postprocess"],
-        default="all",
-        help="Execution step: 'sort', 'stack', 'align', 'fuse', 'postprocess', or 'all'",
     )
     parser.add_argument(
         "--sharpen",
