@@ -12,7 +12,10 @@ from .alignment import (
 )
 from .exif_parser import sort_rafs_by_exposure
 from .hdr_fusion import fuse_and_export_hdr
-from .siril_bridge import demosaic_all_buckets_with_siril
+from .siril_bridge import (
+    demosaic_all_buckets_with_siril,
+    register_and_stack_with_siril,
+)
 
 
 def run_sort(input_path: Path, work_path: Path) -> dict[str, Path]:
@@ -22,6 +25,7 @@ def run_sort(input_path: Path, work_path: Path) -> dict[str, Path]:
 
 def run_stack(
     work_path: Path,
+    stacking_engine: str = "python",
     sigma_low: float = 3.0,
     sigma_high: float = 3.0,
 ) -> list[Path]:
@@ -33,40 +37,57 @@ def run_stack(
         )
 
     print(
-        f"\n--- [Stage 2] Intra-Bucket Stacking ({len(bucket_dirs)} Buckets) ---",
+        f"\n--- [Stage 2] Intra-Bucket Stacking ({len(bucket_dirs)} Buckets) [Engine: {stacking_engine.upper()}] ---",
         flush=True,
     )
 
-    # 1. Demosaic all buckets in a single Siril session
-    bucket_fits_map = demosaic_all_buckets_with_siril(bucket_dirs)
-
     master_paths: list[Path] = []
 
-    # 2. Stack each bucket using Python Sub-pixel DFT + MAD Sigma Clipping
-    for b_path in bucket_dirs:
-        exp_str = b_path.name.replace("bucket_", "")
-        master_fit_name = f"Master_{exp_str}.fit"
-        master_fits_path = b_path / master_fit_name
+    if stacking_engine == "siril":
+        # Native Siril C engine handles registration & stacking per bucket on disk
+        for b_path in bucket_dirs:
+            exp_str = b_path.name.replace("bucket_", "")
+            master_fit_name = f"Master_{exp_str}"
+            print(
+                f"\n[{b_path.name}] Stacking via Siril native C engine...", flush=True
+            )
+            master_fits_path = register_and_stack_with_siril(
+                bucket_dir=b_path,
+                output_master_name=master_fit_name,
+                sigma_low=sigma_low,
+                sigma_high=sigma_high,
+            )
+            print(f"  [Saved] -> {master_fits_path.name}", flush=True)
+            master_paths.append(master_fits_path)
+    else:
+        # Python engine: Demosaic via PySiril, then align & stack in memory
+        bucket_fits_map = demosaic_all_buckets_with_siril(bucket_dirs)
 
-        conv_fits_paths = bucket_fits_map.get(b_path, [])
-        print(
-            f"\n[{b_path.name}] Stacking {len(conv_fits_paths)} frames...", flush=True
-        )
+        for b_path in bucket_dirs:
+            exp_str = b_path.name.replace("bucket_", "")
+            master_fit_name = f"Master_{exp_str}.fit"
+            master_fits_path = b_path / master_fit_name
 
-        master_img = align_and_stack_bucket_dft(
-            fits_paths=conv_fits_paths,
-            sigma_low=sigma_low,
-            sigma_high=sigma_high,
-            upsample_factor=100,
-        )
+            conv_fits_paths = bucket_fits_map.get(b_path, [])
+            print(
+                f"\n[{b_path.name}] Python DFT Stacking ({len(conv_fits_paths)} frames)...",
+                flush=True,
+            )
 
-        fits.writeto(
-            master_fits_path,
-            np.transpose(master_img, (2, 0, 1)),
-            overwrite=True,
-        )
-        print(f"  [Saved] -> {master_fits_path.name}", flush=True)
-        master_paths.append(master_fits_path)
+            master_img = align_and_stack_bucket_dft(
+                fits_paths=conv_fits_paths,
+                sigma_low=sigma_low,
+                sigma_high=sigma_high,
+                upsample_factor=100,
+            )
+
+            fits.writeto(
+                master_fits_path,
+                np.transpose(master_img, (2, 0, 1)),
+                overwrite=True,
+            )
+            print(f"  [Saved] -> {master_fits_path.name}", flush=True)
+            master_paths.append(master_fits_path)
 
     return master_paths
 
@@ -170,6 +191,12 @@ def main() -> None:
         help="Output path for the 16-bit master HDR TIFF",
     )
     parser.add_argument(
+        "--stacking-engine",
+        choices=["python", "siril"],
+        default="python",
+        help="Intra-bucket stacking engine: 'python' (in-memory DFT cross-correlation) or 'siril' (native C engine)",
+    )
+    parser.add_argument(
         "--sigma-low",
         type=float,
         default=3.0,
@@ -213,7 +240,7 @@ def main() -> None:
 
     if args.step == "all":
         run_sort(input_path, work_path)
-        run_stack(work_path, args.sigma_low, args.sigma_high)
+        run_stack(work_path, args.stacking_engine, args.sigma_low, args.sigma_high)
         run_align(work_path)
         run_fuse(
             work_path,
@@ -227,7 +254,7 @@ def main() -> None:
         run_sort(input_path, work_path)
 
     elif args.step == "stack":
-        run_stack(work_path, args.sigma_low, args.sigma_high)
+        run_stack(work_path, args.stacking_engine, args.sigma_low, args.sigma_high)
 
     elif args.step == "align":
         run_align(work_path)
