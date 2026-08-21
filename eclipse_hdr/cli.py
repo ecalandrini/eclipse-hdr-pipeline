@@ -226,6 +226,12 @@ def main() -> None:
         default=0.2,
         help="Mertens well-exposedness weight",
     )
+    parser.add_argument(
+        "--max-shift",
+        type=float,
+        default=50.0,
+        help="Maximum allowable shift in pixels before a subframe is excluded as an outlier (default: 50.0px)",
+    )
 
     args = parser.parse_args()
     work_path = args.work_dir.resolve()
