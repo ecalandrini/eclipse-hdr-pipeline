@@ -131,3 +131,59 @@ def register_and_stack_with_siril(
     finally:
         app.Close()
         del app
+
+
+def demosaic_all_buckets_with_siril(bucket_dirs: list[Path]) -> dict[Path, list[Path]]:
+    """Opens a single Siril session to demosaic all bucket folders sequentially."""
+    results: dict[Path, list[Path]] = {}
+
+    # Check if all buckets already have converted FITS files
+    buckets_to_process = []
+    for b_path in bucket_dirs:
+        conv_dir = b_path / "conv"
+        fits_files = sorted(conv_dir.glob("*.fit")) + sorted(conv_dir.glob("*.fits"))
+        if fits_files:
+            results[b_path] = fits_files
+        else:
+            buckets_to_process.append(b_path)
+
+    if not buckets_to_process:
+        return results
+
+    app = Siril()
+    app.Open()
+    cmd = Wrapper(app)
+
+    try:
+        for b_path in buckets_to_process:
+            print(f"  * Demosaicing RAW frames in {b_path.name}...", flush=True)
+            cmd.cd(str(b_path))
+
+            try:
+                cmd.convertraw("light", debayer=True, out="conv")
+            except Exception:
+                app.Send("convertraw light -debayer -out=conv")
+
+            conv_dir = b_path / "conv"
+            fits_files = sorted(conv_dir.glob("*.fit")) + sorted(
+                conv_dir.glob("*.fits")
+            )
+            if not fits_files:
+                # Fallback check in root
+                fits_files = sorted(b_path.glob("light_*.fit")) + sorted(
+                    b_path.glob("conv_*.fit")
+                )
+
+            if not fits_files:
+                raise FileNotFoundError(
+                    f"Failed to find demosaiced FITS files in {b_path.name}"
+                )
+
+            results[b_path] = fits_files
+    finally:
+        try:
+            app.Close()
+        except Exception:
+            pass
+
+    return results
