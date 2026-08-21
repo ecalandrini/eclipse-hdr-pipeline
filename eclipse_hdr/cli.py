@@ -188,16 +188,16 @@ def run_align(work_path: Path) -> list[Path]:
 def run_fuse(
     work_path: Path,
     output_path: Path,
+    mode: str = "both",
     contrast_w: float = 0.8,
     sat_w: float = 1.0,
     exp_w: float = 0.8,
 ) -> Path:
-    """Stage 4: Multi-scale Mertens HDR fusion."""
+    """Stage 4: Dual-mode HDR fusion (Scientific & Artistic)."""
     aligned_files = sorted(work_path.glob("bucket_*/Aligned_Master_*.fit"))
     if not aligned_files:
         raise FileNotFoundError(f"No Aligned_Master_*.fit files found in {work_path}. Run '--step align' first.")
 
-    print(f"\n--- [Stage 4] Loading {len(aligned_files)} Aligned Masters for Fusion ---", flush=True)
     aligned_masters = [load_fits_to_float32(p) for p in aligned_files]
     master_names = [p.stem.replace("Aligned_Master_", "Bucket_") for p in aligned_files]
 
@@ -205,6 +205,7 @@ def run_fuse(
         aligned_masters=aligned_masters,
         master_names=master_names,
         output_path=output_path,
+        mode=mode,
         contrast_w=contrast_w,
         sat_w=sat_w,
         exp_w=exp_w,
