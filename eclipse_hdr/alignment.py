@@ -11,9 +11,10 @@ from skimage.registration import phase_cross_correlation
 
 def load_fits_to_float32(fits_path: Path) -> np.ndarray:
     """Loads a FITS file and returns an (H, W, C) float32 RGB array normalized to [0.0, 1.0]."""
-    with fits.open(fits_path, memmap=True) as hdul:
+    with fits.open(fits_path, memmap=False) as hdul:
         data = hdul[0].data.astype(np.float32)
 
+    # Convert from FITS (C, H, W) to standard image (H, W, C)
     if data.ndim == 3:
         if data.shape[0] == 3:
             img = np.transpose(data, (1, 2, 0))
