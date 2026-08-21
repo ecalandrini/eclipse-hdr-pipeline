@@ -36,12 +36,23 @@ def load_fits_to_float32(fits_path: Path) -> np.ndarray:
 
 
 def save_preview_jpg(
-    img_float32: np.ndarray, output_jpg_path: Path, gamma: float = 2.2
+    img_float32: np.ndarray, output_jpg_path: Path, stretch_factor: float = 1000.0
 ) -> None:
-    """Saves a tonemapped 8-bit sRGB JPEG preview of a linear master frame."""
-    # Midtone stretch / Gamma correction for visual inspection
-    stretched = np.power(np.clip(img_float32, 0.0, 1.0), 1.0 / gamma)
-    img_8bit = (stretched * 255.0).astype(np.uint8)
+    """Saves an auto-stretched, tonemapped 8-bit sRGB JPEG preview using arcsinh scaling."""
+    # Find background pedestal (median of lowest 5% intensity)
+    lum = (
+        0.299 * img_float32[:, :, 0]
+        + 0.587 * img_float32[:, :, 1]
+        + 0.114 * img_float32[:, :, 2]
+    )
+    bg = np.percentile(lum, 1.0)
+
+    # Background-subtracted Asinh stretch
+    stretched = np.arcsinh(
+        np.maximum(0.0, img_float32 - bg) * stretch_factor
+    ) / np.arcsinh(stretch_factor)
+    img_8bit = (np.clip(stretched, 0.0, 1.0) * 255.0).astype(np.uint8)
+
     pil_img = Image.fromarray(img_8bit, mode="RGB")
     pil_img.save(output_jpg_path, quality=92)
 
