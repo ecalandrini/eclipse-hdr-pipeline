@@ -7,9 +7,10 @@ import numpy as np
 
 from eclipse_hdr.alignment import (
     align_and_stack_bucket_dft,
-    align_masters_graph,
+    apply_spatial_shift_rgb,
     load_fits_to_float32,
     save_preview_jpg,
+    solve_alignment_shifts_graph,
 )
 from .exif_parser import sort_rafs_by_exposure
 from .hdr_fusion import fuse_and_export_hdr
@@ -127,60 +128,45 @@ def run_stack(
 
 
 def run_align(work_path: Path) -> list[Path]:
-    """Stage 3: Inter-master graph feature alignment.
-
-    Loads all master FITS, registers them via high-pass correlation graph,
-    and saves Aligned_Master_*.fit files.
-    """
+    """Stage 3: Memory-safe streamed inter-master alignment."""
     master_files = sorted(work_path.glob("bucket_*/Master_*.fit"))
     if not master_files:
-        raise FileNotFoundError(
-            f"No Master_*.fit files found in {work_path}. Run '--step stack' first."
-        )
+        raise FileNotFoundError(f"No Master_*.fit files found in {work_path}. Run '--step stack' first.")
 
-    print(
-        f"\n--- [Stage 3] Inter-Master Graph Alignment ({len(master_files)} Masters Found) ---",
-        flush=True,
+    # 1. Solve shifts on lightweight proxies (<50MB RAM)
+    anchor_idx, shifts = solve_alignment_shifts_graph(
+        master_files=master_files,
+        downsample=4,
+        upsample_factor=100,
     )
 
-    # 1. Load all master images into memory
-    print("  * Loading master FITS frames...", flush=True)
-    stacked_masters = [load_fits_to_float32(p) for p in master_files]
-    master_names = [p.stem for p in master_files]
-
-    # 2. Select anchor frame: Pick the exposure with the highest mean coronal signal (e.g., 1/15s)
-    mean_intensities = [float(np.mean(m)) for m in stacked_masters]
-    anchor_idx = int(np.argmax(mean_intensities))
-    print(
-        f"  * Selected Solar Anchor: {master_names[anchor_idx]} (Highest Signal-to-Noise)",
-        flush=True,
-    )
-
-    # 3. Run global feature graph alignment
-    aligned_masters = align_masters_graph(
-        masters=stacked_masters,
-        master_names=master_names,
-        anchor_idx=anchor_idx,
-    )
-
-    # 4. Save aligned masters
+    # 2. Stream and apply shifts one frame at a time
     aligned_paths: list[Path] = []
-    print("\n--- Saving Aligned Masters ---", flush=True)
-    for aligned_img, src_path in zip(aligned_masters, master_files):
+    print("\n--- Streaming Aligned Masters to Disk ---", flush=True)
+
+    for src_path, (dy, dx) in zip(master_files, shifts):
         out_aligned_path = src_path.parent / f"Aligned_{src_path.name}"
         out_aligned_jpg = src_path.parent / f"Aligned_{src_path.stem}.jpg"
 
-        fits.writeto(
-            out_aligned_path,
-            np.transpose(aligned_img, (2, 0, 1)),
-            overwrite=True,
-        )
-        save_preview_jpg(aligned_img, out_aligned_jpg)
-        aligned_paths.append(out_aligned_path)
         print(
-            f"  * Saved: {src_path.parent.name}/{out_aligned_path.name} & {out_aligned_jpg.name}",
+            f"  * {src_path.parent.name:20s} -> Offset: (dy={dy:+.2f}px, dx={dx:+.2f}px) -> Saving...",
             flush=True,
         )
+
+        img = load_fits_to_float32(src_path)
+        shifted = apply_spatial_shift_rgb(img, dy, dx)
+        del img
+
+        fits.writeto(
+            out_aligned_path,
+            np.transpose(shifted, (2, 0, 1)),
+            overwrite=True,
+        )
+        save_preview_jpg(shifted, out_aligned_jpg)
+        aligned_paths.append(out_aligned_path)
+
+        del shifted
+        gc.collect()
 
     return aligned_paths
 
