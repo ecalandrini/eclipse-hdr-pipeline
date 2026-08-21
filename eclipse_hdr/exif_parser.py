@@ -1,55 +1,57 @@
 """EXIF metadata extraction and raw image file organization for exposure brackets."""
 
 from fractions import Fraction
+import io
 from pathlib import Path
 import shutil
 import exifread
 
 
 def get_shutter_speed_str(raw_path: Path) -> str:
-    """Extracts exposure time from raw image EXIF metadata and converts it
+    """Extracts exposure time from Fujifilm .RAF or standard RAW EXIF metadata
 
-    into a clean, filesystem-safe string format (e.g., '1_4000s', '1_15s', '2_0s').
-
-    Args:
-        raw_path: Path to the raw camera file (.RAF, etc.).
-
-    Returns:
-        Standardized string identifier for the exposure speed.
+    and converts it into a filesystem-safe string format (e.g., '1_4000s', '1_15s', '2_0s').
     """
     with open(raw_path, "rb") as f:
-        # Fast EXIF read stopping immediately at the ExposureTime tag
-        tags = exifread.process_file(f, stop_tag="EXIF ExposureTime", details=False)
+        header = f.read(16)
 
-    exp_tag = tags.get("EXIF ExposureTime")
+        # Handle Fujifilm RAF offset pointer to embedded Exif/JPEG
+        if header.startswith(b"FUJIFILMCCD-RAW"):
+            f.seek(84)  # Offset of JPEG preview in Fuji RAF specification
+            jpeg_offset = int.from_bytes(f.read(4), byteorder="big")
+            jpeg_length = int.from_bytes(f.read(4), byteorder="big")
+
+            f.seek(jpeg_offset)
+            jpeg_bytes = f.read(jpeg_length)
+            tags = exifread.process_file(
+                io.BytesIO(jpeg_bytes),
+                stop_tag="EXIF ExposureTime",
+                details=False,
+            )
+        else:
+            # Standard TIFF/DNG/CR2 fallback
+            f.seek(0)
+            tags = exifread.process_file(f, stop_tag="EXIF ExposureTime", details=False)
+
+    exp_tag = tags.get("EXIF ExposureTime") or tags.get("Image ExposureTime")
     if not exp_tag:
         raise ValueError(f"Could not locate 'EXIF ExposureTime' tag in {raw_path.name}")
 
     val_str = str(exp_tag).strip()
 
-    # Sub-second fractional representations (e.g., '1/4000', '1/125')
+    # Fractional shutter speed (e.g. '1/4000', '1/125')
     if "/" in val_str:
         num, den = map(int, val_str.split("/"))
         frac = Fraction(num, den)
         return f"{frac.numerator}_{frac.denominator}s"
     else:
-        # Multi-second exposures (e.g., '2', '2.5')
+        # Long exposures (e.g. '2', '2.5')
         val_float = float(val_str)
         return f"{val_float:.1f}s".replace(".", "_")
 
 
 def sort_rafs_by_exposure(source_dir: Path, output_base_dir: Path) -> dict[str, Path]:
-    """Scans the source directory for raw files and organizes them into
-
-    subdirectories grouped by their shutter speed.
-
-    Args:
-        source_dir: Directory containing unorganized raw (.RAF) files.
-        output_base_dir: Root workspace directory where bucket folders will be created.
-
-    Returns:
-        Dictionary mapping exposure time strings to their destination folder Paths.
-    """
+    """Scans source_dir for RAW files and organizes them into exposure buckets."""
     source_path = source_dir.resolve()
     base_dest = output_base_dir.resolve()
     base_dest.mkdir(parents=True, exist_ok=True)
