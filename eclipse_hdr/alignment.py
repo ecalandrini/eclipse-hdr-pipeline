@@ -89,23 +89,23 @@ def extract_solar_features(img_rgb: np.ndarray) -> np.ndarray:
 
     # Difference of Gaussians (DoG) isolates fixed prominences & fine coronal filaments
     g1 = cv2.GaussianBlur(lum, (0, 0), sigmaX=1.5)
-    g2 = cv2.GaussianBlur(lum, (0, 0), sigmaX=7.0)
+    g2 = cv2.GaussianBlur(lum, (0, 0), sigmaX=8.0)
     dog = np.maximum(0.0, g1 - g2)
 
-    p99 = float(np.percentile(dog, 99.7)) or 1.0
+    p99 = float(np.percentile(dog, 99.8)) or 1.0
     norm_features = np.clip(dog / p99, 0.0, 1.0)
 
-    # 2D Hanning window to prevent Fourier border leakage
+    # 2D Hanning window to prevent Fourier border wrap-around leakage
     win_y = np.hanning(norm_features.shape[0])
     win_x = np.hanning(norm_features.shape[1])
-    return norm_features * np.outer(win_y, win_x).astype(np.float32)
+    return (norm_features * np.outer(win_y, win_x)).astype(np.float32)
 
 
 def align_masters_graph(
     masters: list[np.ndarray],
     master_names: list[str],
     anchor_idx: int = 0,
-    max_shift: float = 60.0,
+    max_shift: float = 80.0,
     upsample_factor: int = 100,
 ) -> list[np.ndarray]:
     """Graph MST feature alignment anchored to the Solar Coordinate Frame."""
@@ -114,10 +114,11 @@ def align_masters_graph(
         return masters
 
     print(
-        f"\n--- [Stage 3] Solar-Frame Graph Registration ({n} Masters) [Anchor: {master_names[anchor_idx]}] ---",
+        f"\n--- Solving Feature Correlation Graph ({n} Masters) [Anchor: {master_names[anchor_idx]}] ---",
         flush=True,
     )
 
+    # Compute high-pass feature maps (binned 2x for correlation speed)
     features = [extract_solar_features(m)[::2, ::2] for m in masters]
     cost_matrix = np.full((n, n), np.inf)
     shift_matrix = np.zeros((n, n, 2), dtype=np.float64)
@@ -164,7 +165,7 @@ def align_masters_graph(
     for i, (img, name) in enumerate(zip(masters, master_names)):
         dy, dx = float(final_shifts[i, 0]), float(final_shifts[i, 1])
         print(
-            f"  * {name} -> Offset vs Solar Anchor: (dy={dy:+.2f}px, dx={dx:+.2f}px)",
+            f"  * {name} -> Offset vs Solar Anchor: (dy={dy:+.2f}px, dx={dx:+.2f}px, dist={np.hypot(dy, dx):.2f}px)",
             flush=True,
         )
         shifted = apply_spatial_shift_rgb(img, dy, dx)
