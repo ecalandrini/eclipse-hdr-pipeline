@@ -14,11 +14,13 @@ def demosaic_bucket_with_siril(bucket_dir: Path) -> list[Path]:
     app = Siril()
     try:
         app.Open()
+        cmd = Wrapper(app)
+
         # Navigate Siril working directory to target exposure bucket
-        app.cmd(f"cd '{b_path.as_posix()}'")
+        cmd.cd(f"'{b_path.as_posix()}'")
 
         # Convert and demosaic CFA to 32-bit linear FITS sequence (conv_00001.fit, etc.)
-        app.cmd("convert light -debayer -out=conv")
+        cmd.cmd("convert light -debayer -out=conv")
 
         fits_files = sorted(b_path.glob("conv_*.fit"))
         if not fits_files:
@@ -47,23 +49,25 @@ def register_and_stack_with_siril(
     app = Siril()
     try:
         app.Open()
-        app.cmd(f"cd '{b_path.as_posix()}'")
+        cmd = Wrapper(app)
+
+        cmd.cd(f"'{b_path.as_posix()}'")
 
         # 1. Demosaic RAW files to 32-bit linear FITS sequence
-        app.cmd("convert light -debayer -out=conv")
+        cmd.cmd("convert light -debayer -out=conv")
 
         # If only 1 frame exists in the bucket, load and save as master
         if len(raw_files) == 1:
-            app.cmd("load conv_00001.fit")
-            app.cmd(f"save {output_master_name}")
+            cmd.cmd("load conv_00001.fit")
+            cmd.cmd(f"save {output_master_name}")
             return b_path / f"{output_master_name}.fit"
 
         # 2. Register sequence using 2-pass translation (shift-only)
-        app.cmd("register conv -2pass -transf=shift")
-        app.cmd("seqapplyreg conv -framing=current")
+        cmd.cmd("register conv -2pass -transf=shift")
+        cmd.cmd("seqapplyreg conv -framing=current")
 
         # 3. Stack with Winsorized Sigma Clipping and additive normalization
-        app.cmd(
+        cmd.cmd(
             f"stack r_conv rej {sigma_low} {sigma_high} -norm=add -out={output_master_name}"
         )
 
