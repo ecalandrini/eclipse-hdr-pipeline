@@ -287,7 +287,14 @@ def main() -> None:
         default=0.2,
         help="Mertens well-exposedness weight",
     )
-
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["scientific", "artistic", "both"],
+        default="both",
+        help="HDR fusion mode: 'scientific' (linear radiance), 'artistic' (Mertens pyramid), or 'both' (default: both)",
+    )
+    
     args = parser.parse_args()
     work_path = args.work_dir.resolve()
     output_path = args.output.resolve()
@@ -336,6 +343,7 @@ def main() -> None:
         run_fuse(
             work_path,
             output_path,
+            args.mode,
             args.contrast_weight,
             args.sat_weight,
             args.exp_weight,
