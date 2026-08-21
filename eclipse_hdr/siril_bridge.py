@@ -2,19 +2,23 @@
 
 from pathlib import Path
 from pysiril.siril import Siril
+from pysiril.wrapper import Wrapper
 
 
 def demosaic_bucket_with_siril(bucket_dir: Path) -> list[Path]:
-    """Uses PySiril solely to convert and demosaic Fujifilm X-Trans / Bayer RAW (.RAF)
+    """Uses PySiril to convert and demosaic Fujifilm X-Trans / Bayer RAW (.RAF)
 
     files to 32-bit linear FITS sequences for in-memory processing.
     """
     b_path = bucket_dir.resolve()
     app = Siril()
-
     try:
-        app.SendAndWait(f"cd '{b_path.as_posix()}'")
-        app.SendAndWait("convert light -debayer -out=conv")
+        app.Open()
+        # Navigate Siril working directory to target exposure bucket
+        app.cmd(f"cd '{b_path.as_posix()}'")
+
+        # Convert and demosaic CFA to 32-bit linear FITS sequence (conv_00001.fit, etc.)
+        app.cmd("convert light -debayer -out=conv")
 
         fits_files = sorted(b_path.glob("conv_*.fit"))
         if not fits_files:
@@ -42,23 +46,24 @@ def register_and_stack_with_siril(
 
     app = Siril()
     try:
-        app.SendAndWait(f"cd '{b_path.as_posix()}'")
+        app.Open()
+        app.cmd(f"cd '{b_path.as_posix()}'")
 
         # 1. Demosaic RAW files to 32-bit linear FITS sequence
-        app.SendAndWait("convert light -debayer -out=conv")
+        app.cmd("convert light -debayer -out=conv")
 
-        # If only 1 frame exists in the bucket, copy/rename as master
+        # If only 1 frame exists in the bucket, load and save as master
         if len(raw_files) == 1:
-            app.SendAndWait(f"load conv_00001.fit")
-            app.SendAndWait(f"save {output_master_name}")
+            app.cmd("load conv_00001.fit")
+            app.cmd(f"save {output_master_name}")
             return b_path / f"{output_master_name}.fit"
 
         # 2. Register sequence using 2-pass translation (shift-only)
-        app.SendAndWait("register conv -2pass -transf=shift")
-        app.SendAndWait("seqapplyreg conv -framing=current")
+        app.cmd("register conv -2pass -transf=shift")
+        app.cmd("seqapplyreg conv -framing=current")
 
         # 3. Stack with Winsorized Sigma Clipping and additive normalization
-        app.SendAndWait(
+        app.cmd(
             f"stack r_conv rej {sigma_low} {sigma_high} -norm=add -out={output_master_name}"
         )
 
