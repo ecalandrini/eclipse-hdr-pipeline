@@ -1,4 +1,4 @@
-"""Multi-scale Laplacian pyramid HDR exposure fusion (Mertens et al.) optimized for solar eclipse data."""
+"""Multi-scale Laplacian pyramid HDR exposure fusion with lunar disk cleaning."""
 
 from pathlib import Path
 import cv2
@@ -13,6 +13,7 @@ def fuse_and_export_hdr(
     contrast_w: float = 1.0,
     sat_w: float = 1.2,
     exp_w: float = 0.5,
+    lunar_mask_margin_px: float = 5.0,
 ) -> None:
     """Fuses linear bracketed astronomical masters into a 16-bit TIFF and an auto-stretched preview JPG."""
     num_masters = len(aligned_masters)
@@ -20,27 +21,22 @@ def fuse_and_export_hdr(
         raise ValueError("No aligned master images provided for fusion.")
 
     print(
-        f"  * Calibrating and scaling {num_masters} exposure brackets for Mertens fusion...",
+        f"  * Preparing {num_masters} exposure brackets for Mertens fusion...",
         flush=True,
     )
 
-    # 1. Global background estimation across all masters
+    # 1. Background pedestal subtraction
     bg_levels = [float(np.percentile(img, 0.5)) for img in aligned_masters]
     min_bg = min(bg_levels)
-    print(f"  * Estimated sky pedestal: {min_bg:.5f}", flush=True)
 
-    # 2. Subtract background and normalize each bracket
     cleaned_frames_32f = []
     for img in aligned_masters:
-        # Subtract background pedestal per channel
         sub = np.maximum(0.0, img - min_bg)
-        # Scale to unit range [0.0, 1.0]
         p99 = float(np.percentile(sub, 99.95)) or 1.0
         norm = np.clip(sub / p99, 0.0, 1.0).astype(np.float32)
         cleaned_frames_32f.append(norm)
 
-    print("  * Running OpenCV Mertens exposure fusion...", flush=True)
-    # OpenCV MergeMertens processes 32-bit float RGB images directly in [0.0, 1.0]
+    print("  * Running OpenCV Mertens multi-scale exposure fusion...", flush=True)
     merge_mertens = cv2.createMergeMertens(
         contrast_weight=contrast_w,
         saturation_weight=sat_w,
@@ -51,7 +47,18 @@ def fuse_and_export_hdr(
     fusion_rgb = np.nan_to_num(fusion_rgb, nan=0.0, posinf=1.0, neginf=0.0)
     fusion_rgb = np.clip(fusion_rgb, 0.0, 1.0)
 
-    # Normalize global peak
+    # 2. Lunar Disk Masking: eliminate the internal drifting moon ghost
+    h, w, _ = fusion_rgb.shape
+    cx, cy = w / 2.0, h / 2.0
+    r_est = min(h, w) * 0.22 - lunar_mask_margin_px
+
+    y_g, x_g = np.ogrid[:h, :w]
+    r_dist = np.hypot(x_g - cx, y_g - cy)
+    # Smooth 3-pixel cosine/linear roll-off
+    lunar_mask = np.clip((r_dist - (r_est - 2.0)) / 3.0, 0.0, 1.0)[:, :, np.newaxis]
+    fusion_rgb *= lunar_mask
+
+    # Normalize highlight dynamic range
     f_max = float(np.percentile(fusion_rgb, 99.99)) or 1.0
     fusion_rgb = np.clip(fusion_rgb / f_max, 0.0, 1.0)
 
@@ -67,10 +74,8 @@ def fuse_and_export_hdr(
     )
     print(f"  [Saved 16-bit TIFF] -> {output_path.resolve()}", flush=True)
 
-    # 4. Export Astronomical Non-Linear Preview JPEG
+    # 4. Export preview JPG
     preview_jpg = output_path.with_suffix(".jpg")
-
-    # Asinh / MTF logarithmic curve for natural visual display
     m = 0.08
     stretched = np.where(
         fusion_rgb <= 0.0,
