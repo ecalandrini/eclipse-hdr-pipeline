@@ -10,11 +10,11 @@ from skimage.registration import phase_cross_correlation
 
 
 def load_fits_to_float32(fits_path: Path) -> np.ndarray:
-    """Loads a FITS file and returns an (H, W, C) float32 RGB array normalized to [0.0, 1.0]."""
+    """Robustly loads a FITS file and maps it to a normalized (H, W, C) float32 array in [0.0, 1.0]."""
     with fits.open(fits_path, memmap=False) as hdul:
         data = hdul[0].data.astype(np.float32)
 
-    # Convert from FITS (C, H, W) to standard image (H, W, C)
+    # Reorder (C, H, W) -> (H, W, C)
     if data.ndim == 3:
         if data.shape[0] == 3:
             img = np.transpose(data, (1, 2, 0))
@@ -23,38 +23,54 @@ def load_fits_to_float32(fits_path: Path) -> np.ndarray:
     elif data.ndim == 2:
         img = np.repeat(data[:, :, np.newaxis], 3, axis=2)
     else:
-        raise ValueError(f"Unsupported FITS dimension: {data.ndim} in {fits_path}")
+        raise ValueError(f"Unsupported FITS shape: {data.shape} in {fits_path}")
 
-    max_val = np.max(img)
-    if max_val > 1.0:
-        if max_val > 255.0:
-            img /= 65535.0
-        else:
-            img /= 255.0
+    # Robust ADU auto-scaling
+    max_val = float(np.max(img))
+    if max_val > 255.0:
+        img /= 65535.0
+    elif max_val > 1.0:
+        img /= 255.0
 
     return np.clip(img, 0.0, 1.0)
 
 
 def save_preview_jpg(
-    img_float32: np.ndarray, output_jpg_path: Path, stretch_factor: float = 1000.0
+    img_float32: np.ndarray, output_jpg_path: Path, mtf_mid: float = 0.05
 ) -> None:
-    """Saves an auto-stretched, tonemapped 8-bit sRGB JPEG preview using arcsinh scaling."""
-    # Find background pedestal (median of lowest 5% intensity)
-    lum = (
-        0.299 * img_float32[:, :, 0]
-        + 0.587 * img_float32[:, :, 1]
-        + 0.114 * img_float32[:, :, 2]
+    """Exports an 8-bit JPEG preview using an Astronomical Midtone Transfer Function (MTF).
+
+    Reveals faint coronal streamers from linear float data without clipping highlights.
+    """
+    # 1. Estimate background level (median of sky perimeter)
+    h, w, _ = img_float32.shape
+    border_pixels = np.concatenate(
+        [
+            img_float32[:20, :, :].ravel(),
+            img_float32[-20:, :, :].ravel(),
+            img_float32[:, :20, :].ravel(),
+            img_float32[:, -20:, :].ravel(),
+        ]
     )
-    bg = np.percentile(lum, 1.0)
+    bg = float(np.median(border_pixels))
 
-    # Background-subtracted Asinh stretch
-    stretched = np.arcsinh(
-        np.maximum(0.0, img_float32 - bg) * stretch_factor
-    ) / np.arcsinh(stretch_factor)
+    # 2. Subtract sky background pedestal
+    img_sub = np.maximum(0.0, img_float32 - bg)
+    img_max = float(np.percentile(img_sub, 99.99)) or 1.0
+    img_norm = np.clip(img_sub / img_max, 0.0, 1.0)
+
+    # 3. PixInsight-style MTF Stretch: f(x, m) = (m - 1)*x / ((2m - 1)*x - m)
+    # where m = mtf_mid (controls stretch strength; lower = brighter corona)
+    m = mtf_mid
+    stretched = np.where(
+        img_norm <= 0.0,
+        0.0,
+        ((m - 1.0) * img_norm) / (((2.0 * m - 1.0) * img_norm) - m),
+    )
+
     img_8bit = (np.clip(stretched, 0.0, 1.0) * 255.0).astype(np.uint8)
-
     pil_img = Image.fromarray(img_8bit, mode="RGB")
-    pil_img.save(output_jpg_path, quality=92)
+    pil_img.save(output_jpg_path, quality=94)
 
 
 def apply_fourier_shift_rgb(
