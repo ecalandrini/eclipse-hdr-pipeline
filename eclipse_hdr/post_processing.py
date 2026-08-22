@@ -106,18 +106,18 @@ def apply_druckmuller_polar_acf(
     center: tuple[float, float],
     r_lunar: float,
     asinh_beta: float = 20.0,
-    boost: float = 1.4,
+    boost: float = 1.2,
 ) -> np.ndarray:
-    """Miloslav Druckmüller Adaptive Contrast Enhancement in Polar Coordinates."""
+    """Miloslav Druckmüller Adaptive Contrast Enhancement with 2D polar smoothing and SNR gating."""
     h, w, c = img_rgb.shape
     cx, cy = center
     max_r = int(min(cx, cy, w - cx, h - cy) * 0.95)
     n_theta = 1440
 
-    # 1. Compress dynamic range
+    # 1. Non-linear dynamic range compression
     stretched = np.arcsinh(img_rgb * asinh_beta) / np.arcsinh(asinh_beta)
 
-    # 2. Warp to Polar Coordinates (r, theta)
+    # 2. Polar Warp
     polar_img = cv2.warpPolar(
         stretched,
         (max_r, n_theta),
@@ -126,18 +126,31 @@ def apply_druckmuller_polar_acf(
         cv2.WARP_POLAR_LINEAR + cv2.WARP_FILL_OUTLIERS,
     )
 
-    # 3. High-Pass filter along azimuthal angle (Theta)
+    # 3. 2D Low-Pass Background Estimation (Smooths BOTH Theta and Radial Shot Noise)
     polar_high_pass = np.zeros_like(polar_img)
+    pad = 120
+
     for ch in range(c):
         plane = polar_img[:, :, ch]
-        pad = 120
         padded = np.vstack([plane[-pad:, :], plane, plane[:pad, :]])
-        mu_theta = cv2.GaussianBlur(padded, (1, 151), sigmaX=0, sigmaY=35.0)[
+
+        # 2D Gaussian Kernel:
+        # sigmaX=2.5 px along Radius (r) to cancel high-frequency shot noise
+        # sigmaY=35.0 px along Angle (theta) to extract background luminance
+        mu_2d = cv2.GaussianBlur(padded, (15, 121), sigmaX=2.5, sigmaY=35.0)[
             pad:-pad, :
         ]
-        polar_high_pass[:, :, ch] = plane - mu_theta
 
-    # 4. Inverse Polar Transform to Cartesian Space
+        # Extract pure streamer high frequencies
+        diff = plane - mu_2d
+
+        # Suppress noise floor by applying a soft threshold (sigma clipping)
+        noise_std = np.std(diff[:, int(r_lunar * 1.5) :])
+        diff_denoised = np.sign(diff) * np.maximum(0.0, np.abs(diff) - 0.5 * noise_std)
+
+        polar_high_pass[:, :, ch] = diff_denoised
+
+    # 4. Inverse Polar Transform
     cartesian_streamers = cv2.warpPolar(
         polar_high_pass,
         (w, h),
@@ -146,14 +159,21 @@ def apply_druckmuller_polar_acf(
         cv2.WARP_POLAR_LINEAR + cv2.WARP_INVERSE_MAP,
     )
 
-    # 5. Smooth blending
+    # 5. Radial SNR Gate (Matches actual physical coronal decay)
     y_idx, x_idx = np.ogrid[:h, :w]
     dist_map = np.hypot(x_idx - cx, y_idx - cy)
-    moon_gate = np.clip((dist_map - r_lunar) / (0.05 * r_lunar), 0.0, 1.0)
-    sky_gate = np.clip((max_r - dist_map) / (0.25 * max_r), 0.0, 1.0)
-    blend_weight = (moon_gate * sky_gate)[:, :, None]
 
-    final_composite = stretched + (boost * cartesian_streamers * blend_weight)
+    # Smooth transition across inner lunar limb
+    moon_gate = np.clip((dist_map - r_lunar) / (0.04 * r_lunar), 0.0, 1.0)
+
+    # Gaussian radial decay envelope: confines enhancement to R = 222px to 650px
+    r_effective = np.maximum(0.0, dist_map - r_lunar)
+    coronal_decay_envelope = np.exp(-0.5 * (r_effective / 180.0) ** 2)
+
+    total_weight = (moon_gate * coronal_decay_envelope)[:, :, None]
+
+    # Combine with base
+    final_composite = stretched + (boost * cartesian_streamers * total_weight)
     final_composite = np.clip(final_composite * moon_gate[:, :, None], 0.0, 1.0)
 
     return final_composite.astype(np.float32)
