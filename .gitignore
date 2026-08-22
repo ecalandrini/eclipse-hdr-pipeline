@@ -71,3 +71,19 @@ eclipse_workspace/
 *.nef
 *.arw
 *.dng
+
+# Pipeline generated workspaces and caches
+workspace/
+*.tmp/
+.cache/
+
+# Output image artifacts in repository root
+Eclipse_HDR_Master_*
+*.tif
+*.tiff
+*.fits
+*.fit
+*.jpg
+*.jpeg
+*.png
+*_Report.json
