@@ -1,4 +1,4 @@
-"""Miloslav Druckmüller-style Adaptive Contrast Enhancement (ACF) in Polar Space."""
+"""Coronal enhancement module using Ray-Casting Limb Fitting and Druckmüller Polar ACF."""
 
 from pathlib import Path
 from astropy.io import fits
@@ -9,7 +9,7 @@ import tifffile
 
 
 def load_master_for_enhancement(input_path: Path) -> tuple[np.ndarray, bool]:
-    """Loads master array and detects dynamic range format."""
+    """Loads FITS/TIFF master and normalizes to [0.0, 1.0] float32 RGB."""
     ext = input_path.suffix.lower()
     is_linear = False
 
@@ -24,175 +24,176 @@ def load_master_for_enhancement(input_path: Path) -> tuple[np.ndarray, bool]:
         else:
             raise ValueError(f"Unsupported FITS shape: {data.shape}")
 
-        # Protect positive values
         p99 = float(np.percentile(img[img > 0], 99.95)) if np.any(img > 0) else 1.0
         img = np.clip(img / max(p99, 1e-6), 0.0, 1.0)
     else:
-        raw = tifffile.imread(str(input_path))
+        raw = tifffile.imread(str(input_path)).astype(np.float32)
         if raw.ndim == 2:
             raw = np.repeat(raw[:, :, np.newaxis], 3, axis=2)
         elif raw.ndim == 3 and raw.shape[2] > 3:
             raw = raw[:, :, :3]
 
         if raw.dtype == np.uint16:
-            img = raw.astype(np.float32) / 65535.0
+            img = raw / 65535.0
         elif raw.dtype == np.uint8:
-            img = raw.astype(np.float32) / 255.0
+            img = raw / 255.0
         else:
-            img = raw.astype(np.float32)
+            img = raw
             if "linear" in input_path.stem.lower():
                 is_linear = True
 
-        p_max = float(np.percentile(img, 99.99)) or 1.0
-        img = np.clip(img / p_max, 0.0, 1.0)
+        p_max = float(np.percentile(img[img > 0], 99.95)) if np.any(img > 0) else 1.0
+        img = np.clip(img / max(p_max, 1e-6), 0.0, 1.0)
 
     return img, is_linear
 
 
-def detect_solar_center_accurate(img_rgb: np.ndarray) -> tuple[float, float, float]:
-    """Detects solar center (cx, cy) and lunar radius in pixel coordinates."""
-    lum = 0.299 * img_rgb[:, :, 0] + 0.587 * img_rgb[:, :, 1] + 0.114 * img_rgb[:, :, 2]
+def solve_center_and_limb_raycast(
+    img_rgb: np.ndarray,
+    n_rays: int = 360,
+    r_min: int = 100,
+    r_max: int = 380,
+) -> tuple[float, float, float]:
+    """Deterministically finds sub-pixel lunar center and radius via radial gradient ray-casting."""
+    lum = 0.299 * img_rgb[..., 0] + 0.587 * img_rgb[..., 1] + 0.114 * img_rgb[..., 2]
     h, w = lum.shape
+    cx_init, cy_init = float(w / 2.0), float(h / 2.0)
 
-    grad_x = cv2.Sobel(lum, cv2.CV_32F, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(lum, cv2.CV_32F, 0, 1, ksize=3)
-    grad_mag = cv2.magnitude(grad_x, grad_y)
+    angles = np.linspace(0, 2 * np.pi, n_rays, endpoint=False)
+    radii = np.arange(r_min, r_max, 1.0, dtype=np.float32)
 
-    p99 = float(np.percentile(grad_mag, 99.5)) or 1.0
-    edges = (grad_mag > p99 * 0.4).astype(np.uint8) * 255
+    limb_xs, limb_ys = [], []
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        c = max(contours, key=cv2.contourArea)
-        (cx, cy), radius = cv2.minEnclosingCircle(c)
-        if 0.1 * min(h, w) < radius < 0.45 * min(h, w):
-            return float(cx), float(cy), float(radius)
+    for theta in angles:
+        ray_x = cx_init + radii * np.cos(theta)
+        ray_y = cy_init + radii * np.sin(theta)
 
-    return float(w / 2.0), float(h / 2.0), min(h, w) * 0.22
+        valid = (ray_x >= 0) & (ray_x < w - 1) & (ray_y >= 0) & (ray_y < h - 1)
+        if not np.all(valid):
+            continue
+
+        profile = cv2.remap(
+            lum.astype(np.float32),
+            ray_x.astype(np.float32).reshape(1, -1),
+            ray_y.astype(np.float32).reshape(1, -1),
+            interpolation=cv2.INTER_LINEAR,
+        ).ravel()
+
+        d_profile = np.gradient(profile)
+        peak_idx = int(np.argmax(d_profile))
+        r_peak = radii[peak_idx]
+
+        limb_xs.append(cx_init + r_peak * np.cos(theta))
+        limb_ys.append(cy_init + r_peak * np.sin(theta))
+
+    xs = np.array(limb_xs, dtype=np.float64)
+    ys = np.array(limb_ys, dtype=np.float64)
+
+    # Kåsa Algebraic Least Squares Circle Fit
+    A = np.column_stack([2.0 * xs, 2.0 * ys, np.ones_like(xs)])
+    b = xs**2 + ys**2
+    sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+
+    cx = float(sol[0])
+    cy = float(sol[1])
+    r_lunar = float(np.sqrt(sol[2] + cx**2 + cy**2))
+
+    return cx, cy, r_lunar
 
 
-def apply_druckmuller_acf(
+def apply_druckmuller_polar_acf(
     img_rgb: np.ndarray,
     center: tuple[float, float],
     r_lunar: float,
-    boost: float = 1.8,
+    asinh_beta: float = 20.0,
+    boost: float = 1.4,
 ) -> np.ndarray:
-    """Adaptive Contrast Enhancement (ACF) in polar coordinates.
-    
-    Transforms the frame to polar (r, theta), computes azimuthal moving-window
-    mean and standard deviation, standardizes each radial ring to isolate
-    tangential magnetic structures, and maps back to Cartesian coordinates.
-    """
+    """Miloslav Druckmüller Adaptive Contrast Enhancement in Polar Coordinates."""
     h, w, c = img_rgb.shape
     cx, cy = center
-    max_r = int(min(cx, cy, w - cx, h - cy) * 0.98)
-    n_theta = 1440  # High angular resolution
+    max_r = int(min(cx, cy, w - cx, h - cy) * 0.95)
+    n_theta = 1440
 
-    # 1. Non-linear log pre-stretch so noise floor doesn't dominate outer bands
-    log_img = np.log10(np.maximum(img_rgb, 1e-5))
-    
+    # 1. Compress dynamic range
+    stretched = np.arcsinh(img_rgb * asinh_beta) / np.arcsinh(asinh_beta)
+
     # 2. Warp to Polar Coordinates (r, theta)
     polar_img = cv2.warpPolar(
-        log_img,
+        stretched,
         (max_r, n_theta),
         (cx, cy),
         max_r,
         cv2.WARP_POLAR_LINEAR + cv2.WARP_FILL_OUTLIERS,
     )
 
-    # 3. For each color channel, compute moving angular baseline and deviation
-    polar_enhanced = np.zeros_like(polar_img)
-
+    # 3. High-Pass filter along azimuthal angle (Theta)
+    polar_high_pass = np.zeros_like(polar_img)
     for ch in range(c):
         plane = polar_img[:, :, ch]
+        pad = 120
+        padded = np.vstack([plane[-pad:, :], plane, plane[:pad, :]])
+        mu_theta = cv2.GaussianBlur(padded, (1, 151), sigmaX=0, sigmaY=35.0)[
+            pad:-pad, :
+        ]
+        polar_high_pass[:, :, ch] = plane - mu_theta
 
-        # Low-pass filter along theta (angular direction) using large kernel
-        # Wrap borders along theta for 360-degree continuity
-        plane_padded = np.vstack([plane[-90:, :], plane, plane[:90, :]])
-        mu = cv2.GaussianBlur(plane_padded, (1, 101), sigmaX=0, sigmaY=25.0)[90:-90, :]
-
-        # High-pass angular residual
-        diff = plane - mu
-
-        # Standard deviation along theta
-        diff_sq = cv2.GaussianBlur(
-            np.vstack([diff[-90:, :] ** 2, diff ** 2, diff[:90, :] ** 2]),
-            (1, 101),
-            sigmaX=0,
-            sigmaY=25.0,
-        )[90:-90, :]
-        sigma = np.sqrt(np.maximum(diff_sq, 1e-4))
-
-        # Normalized adaptive contrast (Druckmüller quotient)
-        norm_plane = diff / (sigma + 0.05)
-
-        # Re-scale back to displayable dynamic range
-        polar_enhanced[:, :, ch] = norm_plane
-
-    # 4. Warp back to Cartesian coordinates
-    enhanced_cartesian = cv2.warpPolar(
-        polar_enhanced,
+    # 4. Inverse Polar Transform to Cartesian Space
+    cartesian_streamers = cv2.warpPolar(
+        polar_high_pass,
         (w, h),
         (cx, cy),
         max_r,
         cv2.WARP_POLAR_LINEAR + cv2.WARP_INVERSE_MAP,
     )
 
-    # 5. Lunar limb protection & blending with original frame
+    # 5. Smooth blending
     y_idx, x_idx = np.ogrid[:h, :w]
-    dist_r = np.hypot(x_idx - cx, y_idx - cy).astype(np.float32)
+    dist_map = np.hypot(x_idx - cx, y_idx - cy)
+    moon_gate = np.clip((dist_map - r_lunar) / (0.05 * r_lunar), 0.0, 1.0)
+    sky_gate = np.clip((max_r - dist_map) / (0.25 * max_r), 0.0, 1.0)
+    blend_weight = (moon_gate * sky_gate)[:, :, None]
 
-    # Mask: 0 inside Moon, 1 in corona, smoothly tapers to 0 at extreme frame edge
-    coronal_mask = np.clip((dist_r - r_lunar) / (0.04 * r_lunar), 0.0, 1.0)
-    outer_mask = np.clip((max_r - dist_r) / (0.15 * max_r), 0.0, 1.0)
-    blend_mask = (coronal_mask * outer_mask)[:, :, np.newaxis]
+    final_composite = stretched + (boost * cartesian_streamers * blend_weight)
+    final_composite = np.clip(final_composite * moon_gate[:, :, None], 0.0, 1.0)
 
-    # Combine normalized high-pass details with compressed base
-    base_curved = np.arcsinh(img_rgb * 30.0) / np.arcsinh(30.0)
-    
-    # Scale enhanced details to visible range
-    p99_enh = float(np.percentile(np.abs(enhanced_cartesian), 99.5)) or 1.0
-    norm_details = np.clip(enhanced_cartesian / (p99_enh * 1.5), -1.0, 1.0)
-
-    final_rgb = base_curved + (boost * norm_details * blend_mask * 0.4)
-    final_rgb = final_rgb * coronal_mask[:, :, np.newaxis]
-
-    p99_final = float(np.percentile(final_rgb[final_rgb > 0], 99.9)) or 1.0
-    return np.clip(final_rgb / p99_final, 0.0, 1.0).astype(np.float32)
+    return final_composite.astype(np.float32)
 
 
 def process_coronal_features(
     input_master_path: Path,
     output_dir: Path,
     algorithm: str = "druckmuller",
-    sharpen_amount: float = 1.8,
+    sharpen_amount: float = 1.4,
 ) -> None:
     """Full coronal feature enhancement pipeline."""
     print("\n" + "=" * 65, flush=True)
-    print("       CORONAL FEATURE ENHANCEMENT (DRUCKMÜLLER ACF)              ", flush=True)
+    print(
+        "       CORONAL FEATURE ENHANCEMENT PIPELINE                      ", flush=True
+    )
     print("=" * 65, flush=True)
     print(f"  * Input File            : {input_master_path.resolve()}", flush=True)
-    print(f"  * Algorithm             : DRUCKMÜLLER POLAR ACF", flush=True)
-    print(f"  * Boost Intensity       : {sharpen_amount:.2f}", flush=True)
+    print(f"  * Algorithm             : {algorithm.upper()}", flush=True)
 
     img, is_linear = load_master_for_enhancement(input_master_path)
-    cx, cy, r_lunar = detect_solar_center_accurate(img)
-    print(f"  * Solar Centroid        : ({cx:.2f}, {cy:.2f})", flush=True)
-    print(f"  * Lunar Radius          : {r_lunar:.2f} px", flush=True)
+    cx, cy, r_lunar = solve_center_and_limb_raycast(img)
+    print(f"  * Solved Lunar Centroid : ({cx:.2f}, {cy:.2f})", flush=True)
+    print(f"  * Physical Limb Radius  : {r_lunar:.2f} px", flush=True)
     print("-" * 65, flush=True)
 
-    print("  * Computing Polar Adaptive Contrast Normalization...", flush=True)
-    enhanced = apply_druckmuller_acf(
+    enhanced = apply_druckmuller_polar_acf(
         img_rgb=img,
         center=(cx, cy),
         r_lunar=r_lunar,
+        asinh_beta=20.0,
         boost=sharpen_amount,
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 16-Bit Master TIFF
-    out_tiff = output_dir / f"{input_master_path.stem}_Druckmuller_Enhanced.tif"
+    out_tiff = (
+        output_dir / f"{input_master_path.stem}_{algorithm.capitalize()}_Enhanced.tif"
+    )
     tifffile.imwrite(
         str(out_tiff),
         (enhanced * 65535.0).astype(np.uint16),
@@ -201,7 +202,9 @@ def process_coronal_features(
     print(f"  [Exported 16-bit Enhanced TIFF] -> {out_tiff.resolve()}", flush=True)
 
     # Preview JPG
-    out_jpg = output_dir / f"{input_master_path.stem}_Druckmuller_Enhanced.jpg"
+    out_jpg = (
+        output_dir / f"{input_master_path.stem}_{algorithm.capitalize()}_Enhanced.jpg"
+    )
     preview_8u = (enhanced * 255.0).astype(np.uint8)
     Image.fromarray(preview_8u, mode="RGB").save(out_jpg, quality=95)
     print(f"  [Exported Enhanced JPG Preview] -> {out_jpg.resolve()}", flush=True)
