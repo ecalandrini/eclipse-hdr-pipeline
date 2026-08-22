@@ -46,26 +46,29 @@ def compute_magnetic_vector_field(
     h, w = lum.shape
     cx, cy = center
 
-    # 1. Non-linear stretch to boost outer field gradients
-    stretched = np.arcsinh(lum * 25.0) / np.arcsinh(25.0)
+    # 1. Non-linear stretch to boost outer field gradients (explicit float32)
+    stretched = (np.arcsinh(lum.astype(np.float32) * 25.0) / np.arcsinh(25.0)).astype(
+        np.float32
+    )
 
     # 2. Gaussian smoothing to calculate continuous magnetic flux derivatives
-    smoothed = cv2.GaussianBlur(stretched, (0, 0), sigmaX=smoothing_sigma)
+    smoothed = cv2.GaussianBlur(stretched, (0, 0), sigmaX=smoothing_sigma).astype(
+        np.float32
+    )
 
-    # 3. Compute Cartesian image gradients
+    # 3. Compute Cartesian image gradients (source and dest both float32)
     gx = cv2.Sobel(smoothed, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(smoothed, cv2.CV_32F, 0, 1, ksize=3)
     gmag = cv2.magnitude(gx, gy)
 
     # 4. Orthogonal vector field: Plasma filaments run perpendicular to brightness gradients
-    # Vector B = (-gy, gx) oriented radially outward
     bx = -gy
     by = gx
 
     # Ensure vectors point outward away from solar center
     y_idx, x_idx = np.ogrid[:h, :w]
-    rx = x_idx - cx
-    ry = y_idx - cy
+    rx = (x_idx - cx).astype(np.float32)
+    ry = (y_idx - cy).astype(np.float32)
     dot_radial = (bx * rx) + (by * ry)
 
     # Flip vectors pointing inward
