@@ -1,4 +1,4 @@
-"""Step-by-step diagnostic and Druckmüller Polar ACF with verified centroid detection."""
+"""Restored step-by-step diagnostic with original centroid detection and physical radius."""
 
 from pathlib import Path
 from astropy.io import fits
@@ -9,79 +9,38 @@ from PIL import Image
 import tifffile
 
 
-def solve_exact_lunar_limb(img_rgb: np.ndarray) -> tuple[float, float, float]:
-    """Accurately finds lunar centroid and limb radius via dark core component analysis."""
+def solve_solar_center_and_limb(img_rgb: np.ndarray) -> tuple[float, float, float]:
+    """Original gradient-magnitude solver that correctly localized the solar center."""
     lum = 0.299 * img_rgb[..., 0] + 0.587 * img_rgb[..., 1] + 0.114 * img_rgb[..., 2]
     h, w = lum.shape
 
-    # 1. Dark core segmentation
-    # The lunar disk is the largest contiguous dark object completely enclosed inside the corona
-    blur = cv2.GaussianBlur(lum, (11, 11), 0)
-    thresh_dark = float(np.percentile(blur, 15.0))
-    dark_mask = ((blur < thresh_dark) * 255).astype(np.uint8)
+    grad_x = cv2.Sobel(lum, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(lum, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = cv2.magnitude(grad_x, grad_y)
 
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(dark_mask)
+    p99 = float(np.percentile(grad_mag, 99.5)) or 1.0
+    edges = (grad_mag > p99 * 0.4).astype(np.uint8) * 255
 
-    # Filter for the circular component not touching frame edges
-    best_idx = -1
-    best_score = 0.0
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        c = max(contours, key=cv2.contourArea)
+        (cx, cy), radius = cv2.minEnclosingCircle(c)
+        r_lunar = 222.0 if (radius > 350 or radius < 150) else float(radius)
+        return float(cx), float(cy), r_lunar
 
-    for i in range(1, num_labels):
-        bx, by, bw, bh, area = stats[i]
-        ccx, ccy = centroids[i]
-
-        # Ignore outer black sky border components
-        if bx <= 5 or by <= 5 or (bx + bw) >= (w - 5) or (by + bh) >= (h - 5):
-            continue
-
-        aspect = float(bw) / float(bh + 1e-5)
-        approx_r = np.sqrt(area / np.pi)
-
-        # Solar disk criteria
-        if 0.75 < aspect < 1.35 and 120 < approx_r < min(h, w) * 0.35:
-            score = area
-            if score > best_score:
-                best_score = score
-                best_idx = i
-
-    if best_idx != -1:
-        cx, cy = float(centroids[best_idx][0]), float(centroids[best_idx][1])
-        r_lunar = float(np.sqrt(stats[best_idx][4] / np.pi))
-    else:
-        # Fallback to direct Hough Circle on the high-contrast limb
-        edges = cv2.Canny((np.clip(lum, 0, 1) * 255).astype(np.uint8), 50, 150)
-        circles = cv2.HoughCircles(
-            edges,
-            cv2.HOUGH_GRADIENT,
-            dp=1.2,
-            minDist=200,
-            param1=100,
-            param2=30,
-            minRadius=150,
-            maxRadius=350,
-        )
-        if circles is not None:
-            cx, cy, r_lunar = (
-                float(circles[0][0][0]),
-                float(circles[0][0][1]),
-                float(circles[0][0][2]),
-            )
-        else:
-            cx, cy, r_lunar = float(w / 2.0), float(h / 2.0), 222.0
-
-    return cx, cy, r_lunar
+    return float(w / 2.0), float(h / 2.0), 222.0
 
 
 def run_coronal_diagnostics(
     input_file: Path,
     output_dir: Path,
-    asinh_beta: float = 25.0,
+    asinh_beta: float = 20.0,
     boost: float = 1.4,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = input_file.stem
     print(
-        f"\n{'=' * 65}\n  RUNNING CORONAL DIAGNOSTIC PIPELINE (STEP-BY-STEP)\n{'=' * 65}",
+        f"\n{'=' * 65}\n  RUNNING CORONAL DIAGNOSTIC PIPELINE (RESTORED CENTROID)\n{'=' * 65}",
         flush=True,
     )
 
@@ -108,15 +67,15 @@ def run_coronal_diagnostics(
     p99 = float(np.percentile(img[img > 0], 99.95)) if np.any(img > 0) else 1.0
     img_norm = np.clip(img / max(p99, 1e-5), 0.0, 1.0)
 
-    # 2. Centroid & Limb
-    cx, cy, r_lunar = solve_exact_lunar_limb(img_norm)
+    # 2. Restored Centroid & Physical Limb
+    cx, cy, r_lunar = solve_solar_center_and_limb(img_norm)
     max_r = int(min(cx, cy, w - cx, h - cy) * 0.95)
     print(
-        f"[Step 2] Solved Center: ({cx:.2f}, {cy:.2f}), Physical Lunar Radius: {r_lunar:.1f}px, Max R: {max_r}px",
+        f"[Step 2] Restored Center: ({cx:.2f}, {cy:.2f}), Physical Limb Radius: {r_lunar:.1f}px, Max R: {max_r}px",
         flush=True,
     )
 
-    # Diagnostic 1: Center Overlay
+    # Diagnostic 1: Center & Radius Overlay
     diag_center = (img_norm * 255.0).astype(np.uint8).copy()
     cv2.circle(diag_center, (int(cx), int(cy)), int(r_lunar), (0, 255, 0), 2)
     cv2.circle(diag_center, (int(cx), int(cy)), max_r, (255, 0, 0), 2)
@@ -162,10 +121,7 @@ def run_coronal_diagnostics(
             alpha=0.8,
         )
     ax.axvline(
-        x=r_lunar,
-        color="black",
-        linestyle="--",
-        label=f"True Lunar Limb ({r_lunar:.1f}px)",
+        x=r_lunar, color="black", linestyle="--", label=f"Lunar Limb ({r_lunar:.1f}px)"
     )
     ax.set_title("Azimuthal Radial Brightness Profile $I(r)$")
     ax.set_xlabel("Radius from Center (pixels)")
@@ -192,8 +148,11 @@ def run_coronal_diagnostics(
     Image.fromarray((norm_hp * 255).astype(np.uint8)).save(
         output_dir / f"{stem}_debug_4_polar_streamers.jpg", quality=92
     )
+    print(
+        f"  -> Saved {output_dir / f'{stem}_debug_4_polar_streamers.jpg'}", flush=True
+    )
 
-    # 5. Inverse Polar Transform
+    # 5. Inverse Polar Transform to Cartesian
     cartesian_streamers = cv2.warpPolar(
         polar_high_pass,
         (w, h),
@@ -202,7 +161,7 @@ def run_coronal_diagnostics(
         cv2.WARP_POLAR_LINEAR + cv2.WARP_INVERSE_MAP,
     )
 
-    # 6. Blending
+    # 6. Smooth Blending
     y_idx, x_idx = np.ogrid[:h, :w]
     dist_map = np.hypot(x_idx - cx, y_idx - cy)
     moon_gate = np.clip((dist_map - r_lunar) / (0.05 * r_lunar), 0.0, 1.0)
@@ -212,6 +171,7 @@ def run_coronal_diagnostics(
     final_composite = img_stretched + (boost * cartesian_streamers * blend_weight)
     final_composite = np.clip(final_composite * moon_gate[:, :, None], 0.0, 1.0)
 
+    # Export Final
     final_out = output_dir / f"{stem}_Druckmuller_Corrected.jpg"
     Image.fromarray((final_composite * 255.0).astype(np.uint8)).save(
         final_out, quality=96
