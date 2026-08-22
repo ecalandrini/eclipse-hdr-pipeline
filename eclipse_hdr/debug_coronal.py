@@ -10,25 +10,42 @@ import tifffile
 
 
 def solve_solar_center_and_limb(img_rgb: np.ndarray) -> tuple[float, float, float]:
-    """Original gradient-magnitude solver that correctly localized the solar center."""
+    """Fits an exact algebraic least-squares circle directly to the inner lunar limb."""
     lum = 0.299 * img_rgb[..., 0] + 0.587 * img_rgb[..., 1] + 0.114 * img_rgb[..., 2]
     h, w = lum.shape
 
+    # 1. High-pass gradient magnitude to isolate sharp limb transition
     grad_x = cv2.Sobel(lum, cv2.CV_32F, 1, 0, ksize=3)
     grad_y = cv2.Sobel(lum, cv2.CV_32F, 0, 1, ksize=3)
     grad_mag = cv2.magnitude(grad_x, grad_y)
 
-    p99 = float(np.percentile(grad_mag, 99.5)) or 1.0
-    edges = (grad_mag > p99 * 0.4).astype(np.uint8) * 255
+    # 2. Extract edge points strictly along the sharp inner boundary
+    p_edge = float(np.percentile(grad_mag, 99.4))
+    edge_pts = np.argwhere(grad_mag > p_edge)  # Array of (y, x) coords
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        c = max(contours, key=cv2.contourArea)
-        (cx, cy), radius = cv2.minEnclosingCircle(c)
-        r_lunar = 222.0 if (radius > 350 or radius < 150) else float(radius)
-        return float(cx), float(cy), r_lunar
+    # 3. Initial centroid estimate
+    cy_init = float(np.mean(edge_pts[:, 0]))
+    cx_init = float(np.mean(edge_pts[:, 1]))
 
-    return float(w / 2.0), float(h / 2.0), 222.0
+    # Filter out far-field outliers: keep only points within annular zone of the limb
+    r_dists = np.hypot(edge_pts[:, 1] - cx_init, edge_pts[:, 0] - cy_init)
+    r_med = float(np.median(r_dists))
+    valid_pts = edge_pts[np.abs(r_dists - r_med) < 30.0]
+
+    # 4. Kåsa / Pratt Algebraic Least Squares Circle Fit:
+    # Solves: [2*x, 2*y, 1] @ [cx, cy, C]^T = x^2 + y^2
+    xs = valid_pts[:, 1].astype(np.float64)
+    ys = valid_pts[:, 0].astype(np.float64)
+
+    A = np.column_stack([2.0 * xs, 2.0 * ys, np.ones_like(xs)])
+    b = xs**2 + ys**2
+    sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+
+    cx = float(sol[0])
+    cy = float(sol[1])
+    r_lunar = float(np.sqrt(sol[2] + cx**2 + cy**2))
+
+    return cx, cy, r_lunar
 
 
 def run_coronal_diagnostics(
